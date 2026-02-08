@@ -1,0 +1,37 @@
+version: 1.0
+
+runtime: python312
+
+build:
+  commands:
+    build:
+      - pip install -r requirements.txt
+
+run:
+  command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+  network:
+    port: 8000
+    env: PORT
+  env:
+    - name: PYTHONPATH
+      value: "/app"
+    - name: ENVIRONMENT
+      value: "production"
+    - name: LOG_LEVEL
+      value: "INFO"
+
+  secrets:
+    - name: AWS_ACCESS_KEY_ID
+      value-from: "arn:aws:secretsmanager:us-east-1:ACCOUNT_ID:secret:petmed/aws-credentials:AWS_ACCESS_KEY_ID::"
+    - name: AWS_SECRET_ACCESS_KEY
+      value-from: "arn:aws:secretsmanager:us-east-1:ACCOUNT_ID:secret:petmed/aws-credentials:AWS_SECRET_ACCESS_KEY::"
+    - name: COGNITO_USER_POOL_ID
+      value-from: "arn:aws:secretsmanager:us-east-1:ACCOUNT_ID:secret:petmed/cognito:USER_POOL_ID::"
+    - name: COGNITO_CLIENT_ID
+      value-from: "arn:aws:secretsmanager:us-east-1:ACCOUNT_ID:secret:petmed/cognito:CLIENT_ID::"
+    - name: GOOGLE_CLOUD_PROJECT
+      value-from: "arn:aws:secretsmanager:us-east-1:ACCOUNT_ID:secret:petmed/google:PROJECT_ID::"
+    - name: PINECONE_API_KEY
+      value-from: "arn:aws:secretsmanager:us-east-1:ACCOUNT_ID:secret:petmed/pinecone:API_KEY::"
+    - name: REDIS_URL
+      value-from: "arn:aws:secretsmanager:us-east-1:ACCOUNT_ID:secret:petmed/redis:URL::"
