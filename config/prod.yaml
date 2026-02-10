@@ -1,0 +1,61 @@
+# Production Configuration
+# These values should be set via environment variables or AWS Secrets Manager
+
+app:
+  name: "PetMed API"
+  version: "0.1.0"
+  environment: "production"
+  debug: false
+  log_level: "INFO"
+
+api:
+  v1_prefix: "/v1"
+  allowed_origins:
+    - "https://petmed.app"
+    - "https://www.petmed.app"
+
+aws:
+  region: "us-east-1"
+  dynamodb:
+    table_name: "petmed-prod"
+    # No endpoint_url - uses AWS default
+  s3:
+    bucket_name: "petmed-documents-prod"
+    presigned_url_expiry: 3600
+  cognito:
+    # Set via AWS Secrets Manager
+    user_pool_id: "${COGNITO_USER_POOL_ID}"
+    client_id: "${COGNITO_CLIENT_ID}"
+
+redis:
+  # Set via AWS Secrets Manager - use ElastiCache
+  url: "${REDIS_URL}"
+  max_connections: 50
+
+google_cloud:
+  project: "${GOOGLE_CLOUD_PROJECT}"
+  location: "us-central1"
+  gemini_model: "gemini-2.5-pro"
+  gemini_flash_model: "gemini-2.5-flash"
+  embedding_model: "text-embedding-004"
+  embedding_dimensions: 768
+
+pinecone:
+  # Set via AWS Secrets Manager
+  api_key: "${PINECONE_API_KEY}"
+  index_name: "petmed-knowledge-prod"
+  namespace: "documents"
+
+rag:
+  chunk_size: 1000
+  chunk_overlap: 200
+  top_k: 5
+  similarity_threshold: 0.7
+
+pdf:
+  max_size_mb: 50
+  max_pages: 500
+
+rate_limiting:
+  requests: 100
+  window_seconds: 60

@@ -1,0 +1,56 @@
+# Local Development Configuration
+# Copy to .env or set these environment variables
+
+app:
+  name: "PetMed API"
+  version: "0.1.0"
+  environment: "development"
+  debug: true
+  log_level: "DEBUG"
+
+api:
+  v1_prefix: "/v1"
+  allowed_origins:
+    - "http://localhost:3000"
+    - "http://127.0.0.1:3000"
+
+aws:
+  region: "us-east-1"
+  # For local development with LocalStack
+  dynamodb:
+    table_name: "petmed"
+    endpoint_url: "http://localhost:4566"
+  s3:
+    bucket_name: "petmed-documents"
+    endpoint_url: "http://localhost:4566"
+    presigned_url_expiry: 3600
+  cognito:
+    user_pool_id: "us-east-1_localdev"
+    client_id: "local-client-id"
+
+redis:
+  url: "redis://localhost:6379"
+  max_connections: 10
+
+google_cloud:
+  project: "your-gcp-project-id"
+  location: "us-central1"
+  gemini_model: "gemini-2.5-pro"
+  gemini_flash_model: "gemini-2.5-flash"
+  embedding_model: "text-embedding-004"
+  embedding_dimensions: 768
+
+pinecone:
+  api_key: "your-pinecone-api-key"
+  index_name: "petmed-knowledge"
+  namespace: "documents"
+
+rag:
+  chunk_size: 1000
+  chunk_overlap: 200
+  top_k: 5
+  similarity_threshold: 0.7
+
+pdf:
+  max_size_mb: 50
+  max_pages: 500
