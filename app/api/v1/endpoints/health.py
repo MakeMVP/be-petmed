@@ -1,7 +1,6 @@
 """Health check endpoints."""
 
 from datetime import UTC, datetime
-from typing import Any
 
 from fastapi import APIRouter, Response, status
 
@@ -71,12 +70,6 @@ async def readiness_check(response: Response) -> ReadinessResponse:
     dependencies: list[DependencyHealth] = []
     all_healthy = True
 
-    # Check Redis
-    redis_health = await _check_redis()
-    dependencies.append(redis_health)
-    if redis_health.status != "healthy":
-        all_healthy = False
-
     # Check DynamoDB
     dynamodb_health = await _check_dynamodb()
     dependencies.append(dynamodb_health)
@@ -102,51 +95,18 @@ async def readiness_check(response: Response) -> ReadinessResponse:
     )
 
 
-async def _check_redis() -> DependencyHealth:
-    """Check Redis connectivity."""
-    import time
-
-    try:
-        import redis.asyncio as redis
-
-        start = time.perf_counter()
-        client = redis.from_url(settings.redis_url, decode_responses=True)
-        await client.ping()
-        await client.aclose()
-        latency = (time.perf_counter() - start) * 1000
-
-        return DependencyHealth(
-            name="redis",
-            status="healthy",
-            latency_ms=round(latency, 2),
-        )
-    except Exception as e:
-        logger.warning("Redis health check failed", error=str(e))
-        return DependencyHealth(
-            name="redis",
-            status="unhealthy",
-            error=str(e),
-        )
-
-
 async def _check_dynamodb() -> DependencyHealth:
-    """Check DynamoDB connectivity."""
+    """Check DynamoDB connectivity using the singleton client."""
     import time
 
     try:
-        import aioboto3
+        from app.db.dynamodb import get_dynamodb_client
 
         start = time.perf_counter()
-        session = aioboto3.Session()
-
-        async with session.resource(
-            "dynamodb",
-            region_name=settings.aws_region,
-            endpoint_url=settings.dynamodb_endpoint_url,
-        ) as dynamodb:
-            table = await dynamodb.Table(settings.dynamodb_table_name)
-            await table.table_status
-            latency = (time.perf_counter() - start) * 1000
+        db = get_dynamodb_client()
+        # Simple query to verify connectivity
+        await db.query(pk="USER#EMAIL", index_name="GSI1", limit=1)
+        latency = (time.perf_counter() - start) * 1000
 
         return DependencyHealth(
             name="dynamodb",

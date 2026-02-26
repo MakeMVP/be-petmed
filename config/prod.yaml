@@ -13,6 +13,8 @@ api:
   allowed_origins:
     - "https://petmed.app"
     - "https://www.petmed.app"
+    - "https://main.d3e3do3dh8mpnp.amplifyapp.com"
+    - "http://localhost:3001"
 
 aws:
   region: "us-east-1"
@@ -27,10 +29,8 @@ aws:
     user_pool_id: "${COGNITO_USER_POOL_ID}"
     client_id: "${COGNITO_CLIENT_ID}"
 
-redis:
-  # Set via AWS Secrets Manager - use ElastiCache
-  url: "${REDIS_URL}"
-  max_connections: 50
+lambda:
+  function_name: "petmed-document-worker"
 
 google_cloud:
   project: "${GOOGLE_CLOUD_PROJECT}"

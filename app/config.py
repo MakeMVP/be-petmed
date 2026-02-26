@@ -58,9 +58,11 @@ class Settings(BaseSettings):
     s3_endpoint_url: str | None = None  # For local development
     s3_presigned_url_expiry: int = 3600  # seconds
 
-    # Redis
-    redis_url: str = "redis://localhost:6379"
-    redis_max_connections: int = 10
+    # Redis (optional — only needed if rate limiting enabled)
+    redis_url: str | None = None
+
+    # Lambda
+    lambda_function_name: str = "petmed-document-worker"
 
     # Google Cloud / Vertex AI
     google_cloud_project: str = ""

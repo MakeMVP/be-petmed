@@ -71,8 +71,10 @@ async def upload_document(
         s3_key="",  # Will be updated after upload
     )
 
-    # Generate S3 key
-    s3_key = f"documents/{current_user.user_id}/{doc.doc_id}/{doc.filename}"
+    # Generate S3 key (use doc_id for safe ASCII key)
+    from urllib.parse import quote
+
+    s3_key = f"documents/{current_user.user_id}/{doc.doc_id}/{doc.doc_id}.pdf"
     doc.s3_key = s3_key
 
     # Upload to S3
@@ -83,7 +85,7 @@ async def upload_document(
         metadata={
             "doc_id": doc.doc_id,
             "user_id": current_user.user_id,
-            "original_filename": doc.filename,
+            "original_filename": quote(doc.filename, safe=""),
         },
     )
 

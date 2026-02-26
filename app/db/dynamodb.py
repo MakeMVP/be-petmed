@@ -18,7 +18,11 @@ class DynamoDBClient:
     """Async DynamoDB client with single-table design patterns."""
 
     def __init__(self) -> None:
-        self._session = aioboto3.Session()
+        self._session = aioboto3.Session(
+            aws_access_key_id=settings.aws_access_key_id,
+            aws_secret_access_key=settings.aws_secret_access_key,
+            region_name=settings.aws_region,
+        )
         self._table_name = settings.dynamodb_table_name
 
     async def _get_table(self) -> Any:
@@ -239,6 +243,45 @@ class DynamoDBClient:
             deleted = "Attributes" in response
             logger.debug("Deleted item", pk=pk, sk=sk, deleted=deleted)
             return deleted
+
+    async def scan(
+        self,
+        filter_expression: Any | None = None,
+        limit: int | None = None,
+        exclusive_start_key: dict[str, Any] | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        """Scan the entire table with optional filtering.
+
+        Args:
+            filter_expression: Optional filter expression.
+            limit: Maximum items to return.
+            exclusive_start_key: Pagination cursor.
+
+        Returns:
+            Tuple of (items, last_evaluated_key for pagination).
+        """
+        async with self._session.resource(
+            "dynamodb",
+            region_name=settings.aws_region,
+            endpoint_url=settings.dynamodb_endpoint_url,
+        ) as dynamodb:
+            table = await dynamodb.Table(self._table_name)
+
+            params: dict[str, Any] = {}
+
+            if filter_expression:
+                params["FilterExpression"] = filter_expression
+            if limit:
+                params["Limit"] = limit
+            if exclusive_start_key:
+                params["ExclusiveStartKey"] = exclusive_start_key
+
+            response = await table.scan(**params)
+
+            return (
+                response.get("Items", []),
+                response.get("LastEvaluatedKey"),
+            )
 
     async def batch_write(self, items: list[dict[str, Any]]) -> None:
         """Batch write items (put or delete).
