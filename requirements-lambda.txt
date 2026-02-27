@@ -1,0 +1,26 @@
+# Core
+fastapi>=0.115.0
+pydantic>=2.10.0
+pydantic-settings>=2.6.0
+
+# AWS
+boto3>=1.35.0
+aioboto3>=13.0.0
+
+# Google AI
+google-genai>=1.8.0
+google-cloud-aiplatform>=1.70.0
+
+# Vector DB
+pinecone[grpc]>=5.0.0
+
+# PDF Processing (PyMuPDF only — no unstructured/tesseract needed)
+PyMuPDF>=1.24.0
+
+# Logging
+structlog>=24.4.0
+
+# Utilities
+python-ulid>=3.0.0
+httpx>=0.27.0
+orjson>=3.10.0
