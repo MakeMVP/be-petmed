@@ -4,7 +4,7 @@ import asyncio
 from typing import Any
 
 from app.core.logging import get_logger, setup_logging
-from app.workers.tasks import delete_document_data, process_document, reprocess_document
+from app.workers.processing import delete_document_data, process_document, reprocess_document
 
 setup_logging()
 logger = get_logger(__name__)

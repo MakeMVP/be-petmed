@@ -89,8 +89,16 @@ class ServiceContainer:
         # Initialize singletons
         get_dynamodb_client()
         get_storage_service()
-        get_gemini_service()
-        get_embedding_service()
+        try:
+            get_gemini_service()
+        except Exception as e:
+            import structlog
+            structlog.get_logger().warning("Gemini service init failed (chat will be unavailable)", error=str(e))
+        try:
+            get_embedding_service()
+        except Exception as e:
+            import structlog
+            structlog.get_logger().warning("Embedding service init failed", error=str(e))
         get_pinecone_service()
 
         cls._initialized = True
