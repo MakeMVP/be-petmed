@@ -27,12 +27,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Install runtime dependencies for PDF processing
+# Install minimal runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
-    libmagic1 \
-    poppler-utils \
-    tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy installed packages from builder

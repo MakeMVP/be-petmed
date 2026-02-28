@@ -1,0 +1,52 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: ap-northeast-1
+  ECR_REGISTRY: 096753665879.dkr.ecr.ap-northeast-1.amazonaws.com
+  API_REPO: petmed-api
+  WORKER_REPO: petmed-worker
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push API image
+        run: |
+          docker build --platform linux/amd64 \
+            -f Dockerfile \
+            -t $ECR_REGISTRY/$API_REPO:latest \
+            -t $ECR_REGISTRY/$API_REPO:${{ github.sha }} .
+          docker push $ECR_REGISTRY/$API_REPO --all-tags
+
+      - name: Build and push Lambda worker image
+        run: |
+          docker build --platform linux/amd64 \
+            -f Dockerfile.lambda \
+            -t $ECR_REGISTRY/$WORKER_REPO:latest \
+            -t $ECR_REGISTRY/$WORKER_REPO:${{ github.sha }} .
+          docker push $ECR_REGISTRY/$WORKER_REPO --all-tags
+
+      - name: Update Lambda function
+        run: |
+          aws lambda update-function-code \
+            --function-name petmed-document-worker \
+            --image-uri $ECR_REGISTRY/$WORKER_REPO:${{ github.sha }}
