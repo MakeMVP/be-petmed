@@ -123,11 +123,11 @@ async def _check_dynamodb() -> DependencyHealth:
 
 
 async def _check_pinecone() -> DependencyHealth:
-    """Check Pinecone connectivity."""
+    """Check Pinecone connectivity using the singleton service."""
     import time
 
     try:
-        from pinecone import Pinecone
+        from app.services.pinecone_service import get_pinecone_service
 
         if not settings.pinecone_api_key:
             return DependencyHealth(
@@ -137,9 +137,8 @@ async def _check_pinecone() -> DependencyHealth:
             )
 
         start = time.perf_counter()
-        pc = Pinecone(api_key=settings.pinecone_api_key)
-        index = pc.Index(settings.pinecone_index_name)
-        index.describe_index_stats()
+        pinecone = get_pinecone_service()
+        await pinecone.get_stats()
         latency = (time.perf_counter() - start) * 1000
 
         return DependencyHealth(
