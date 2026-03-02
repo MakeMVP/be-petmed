@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     # API
     api_v1_prefix: str = "/v1"
     allowed_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
+    enable_docs: bool = True
 
     # AWS General
     aws_region: str = "us-east-1"
