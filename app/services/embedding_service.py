@@ -1,13 +1,12 @@
 """Gemini embedding service for vector generation."""
 
 import asyncio
-from typing import Any
 
-from google import genai
 from google.genai import types
 
 from app.config import settings
 from app.core.exceptions import ServiceUnavailableError
+from app.core.google import get_genai_client
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -17,11 +16,7 @@ class EmbeddingService:
     """Service for generating text embeddings using Gemini."""
 
     def __init__(self) -> None:
-        self._client = genai.Client(
-            vertexai=True,
-            project=settings.google_cloud_project,
-            location=settings.google_cloud_location,
-        )
+        self._client = get_genai_client()
         self._model = settings.embedding_model
         self._dimensions = settings.embedding_dimensions
 

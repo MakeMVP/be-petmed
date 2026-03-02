@@ -1,15 +1,14 @@
-"""Google Gemini service for LLM operations via Vertex AI."""
+"""Google Gemini service for LLM operations."""
 
 import asyncio
-import base64
 from collections.abc import AsyncIterator
 from typing import Any
 
-from google import genai
 from google.genai import types
 
 from app.config import settings
 from app.core.exceptions import ServiceUnavailableError
+from app.core.google import get_genai_client
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -19,11 +18,7 @@ class GeminiService:
     """Service for Gemini LLM operations."""
 
     def __init__(self) -> None:
-        self._client = genai.Client(
-            vertexai=True,
-            project=settings.google_cloud_project,
-            location=settings.google_cloud_location,
-        )
+        self._client = get_genai_client()
         self._model = settings.gemini_model
         self._flash_model = settings.gemini_flash_model
 
@@ -215,9 +210,6 @@ class GeminiService:
             ServiceUnavailableError: If analysis fails.
         """
         try:
-            # Encode image to base64
-            b64_data = base64.b64encode(image_data).decode("utf-8")
-
             contents = [
                 types.Content(
                     role="user",
