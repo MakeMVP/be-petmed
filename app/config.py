@@ -64,12 +64,13 @@ class Settings(BaseSettings):
     # Lambda
     lambda_function_name: str = "petmed-document-worker"
 
-    # Google Cloud / Vertex AI
+    # Google Cloud / Gemini
     google_cloud_project: str = ""
     google_cloud_location: str = "us-central1"
+    gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-pro"
     gemini_flash_model: str = "gemini-2.5-flash"
-    embedding_model: str = "text-embedding-004"
+    embedding_model: str = "gemini-embedding-001"
     embedding_dimensions: int = 768
 
     # Pinecone
