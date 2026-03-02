@@ -5,6 +5,7 @@ from typing import Annotated
 from fastapi import Depends
 
 from app.core.cognito import CurrentUser, OptionalUser, VerifiedUser
+from app.core.logging import get_logger
 from app.db.dynamodb import DynamoDBClient, get_dynamodb_client
 from app.services.embedding_service import EmbeddingService, get_embedding_service
 from app.services.gemini_service import GeminiService, get_gemini_service
@@ -74,6 +75,9 @@ def get_vector_db() -> PineconeService:
 VectorDB = Annotated[PineconeService, Depends(get_vector_db)]
 
 
+logger = get_logger(__name__)
+
+
 # Service container for initialization
 class ServiceContainer:
     """Container for managing service lifecycle."""
@@ -92,13 +96,11 @@ class ServiceContainer:
         try:
             get_gemini_service()
         except Exception as e:
-            import structlog
-            structlog.get_logger().warning("Gemini service init failed (chat will be unavailable)", error=str(e))
+            logger.warning("Gemini service init failed (chat will be unavailable)", error=str(e))
         try:
             get_embedding_service()
         except Exception as e:
-            import structlog
-            structlog.get_logger().warning("Embedding service init failed", error=str(e))
+            logger.warning("Embedding service init failed", error=str(e))
         get_pinecone_service()
 
         cls._initialized = True
