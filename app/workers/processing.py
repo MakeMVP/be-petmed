@@ -2,8 +2,7 @@
 
 from typing import Any
 
-from app.config import settings
-from app.core.logging import get_logger, setup_logging
+from app.core.logging import get_logger
 from app.db.dynamodb import get_dynamodb_client
 from app.models.entities import Chunk, DocumentStatus
 from app.services.embedding_service import get_embedding_service
@@ -21,7 +20,6 @@ async def process_document(
     filename: str,
 ) -> dict[str, Any]:
     """Process an uploaded PDF document."""
-    setup_logging()
     logger.info("Starting document processing", doc_id=doc_id, filename=filename)
 
     db = get_dynamodb_client()
@@ -148,7 +146,6 @@ async def delete_document_data(
     s3_key: str,
 ) -> dict[str, Any]:
     """Delete all data associated with a document."""
-    setup_logging()
     logger.info("Starting document deletion", doc_id=doc_id)
 
     db = get_dynamodb_client()
@@ -198,7 +195,6 @@ async def reprocess_document(
     filename: str,
 ) -> dict[str, Any]:
     """Reprocess an existing document."""
-    setup_logging()
     logger.info("Starting document reprocessing", doc_id=doc_id)
 
     db = get_dynamodb_client()
