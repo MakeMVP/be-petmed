@@ -3,10 +3,10 @@
 from datetime import UTC, datetime
 from typing import Any, TypeVar
 
-import aioboto3
 from boto3.dynamodb.conditions import Attr, Key
 
 from app.config import settings
+from app.core.aws import get_aioboto3_session
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -18,11 +18,7 @@ class DynamoDBClient:
     """Async DynamoDB client with single-table design patterns."""
 
     def __init__(self) -> None:
-        self._session = aioboto3.Session(
-            aws_access_key_id=settings.aws_access_key_id,
-            aws_secret_access_key=settings.aws_secret_access_key,
-            region_name=settings.aws_region,
-        )
+        self._session = get_aioboto3_session()
         self._table_name = settings.dynamodb_table_name
 
     async def _get_table(self) -> Any:

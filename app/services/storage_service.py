@@ -3,10 +3,10 @@
 import io
 from typing import BinaryIO
 
-import aioboto3
 from botocore.exceptions import ClientError
 
 from app.config import settings
+from app.core.aws import get_aioboto3_session
 from app.core.exceptions import NotFoundError, ServiceUnavailableError
 from app.core.logging import get_logger
 
@@ -17,11 +17,7 @@ class StorageService:
     """Service for S3 file operations."""
 
     def __init__(self) -> None:
-        self._session = aioboto3.Session(
-            aws_access_key_id=settings.aws_access_key_id,
-            aws_secret_access_key=settings.aws_secret_access_key,
-            region_name=settings.aws_region,
-        )
+        self._session = get_aioboto3_session()
         self._bucket = settings.s3_bucket_name
 
     async def upload_file(
