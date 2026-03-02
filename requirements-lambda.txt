@@ -19,6 +19,7 @@ PyMuPDF>=1.24.0
 
 # Logging
 structlog>=24.4.0
+asgi-correlation-id>=4.3.0
 
 # Utilities
 python-ulid>=3.0.0
