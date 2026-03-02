@@ -1,8 +1,7 @@
 FROM public.ecr.aws/lambda/python:3.12
 
-# Install system dependencies for PDF processing
+# Install system dependencies (libgomp for PyMuPDF, file-libs for MIME detection)
 RUN dnf install -y \
-    poppler-utils \
     libgomp \
     file-libs \
     && dnf clean all
@@ -11,7 +10,13 @@ RUN dnf install -y \
 COPY requirements-lambda.txt ${LAMBDA_TASK_ROOT}/
 RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements-lambda.txt
 
-# Copy application code
-COPY app/ ${LAMBDA_TASK_ROOT}/app/
+# Copy only the subpackages the Lambda needs
+COPY app/__init__.py ${LAMBDA_TASK_ROOT}/app/
+COPY app/config.py ${LAMBDA_TASK_ROOT}/app/
+COPY app/core/ ${LAMBDA_TASK_ROOT}/app/core/
+COPY app/db/ ${LAMBDA_TASK_ROOT}/app/db/
+COPY app/models/ ${LAMBDA_TASK_ROOT}/app/models/
+COPY app/services/ ${LAMBDA_TASK_ROOT}/app/services/
+COPY app/workers/ ${LAMBDA_TASK_ROOT}/app/workers/
 
 CMD ["app.workers.lambda_handler.handler"]
