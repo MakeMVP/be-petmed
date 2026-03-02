@@ -39,10 +39,18 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
 async def _dispatch(event: dict[str, Any]) -> dict[str, Any]:
     """Route to the appropriate task function."""
+    # Validate required fields
+    for field in ("action", "doc_id", "user_id", "s3_key"):
+        if field not in event:
+            return {"status": "error", "error": f"Missing required field: '{field}'"}
+
     action = event["action"]
     doc_id = event["doc_id"]
     user_id = event["user_id"]
     s3_key = event["s3_key"]
+
+    if action in ("process", "reprocess") and "filename" not in event:
+        return {"status": "error", "error": f"Missing required field: 'filename' for action '{action}'"}
 
     if action == "process":
         return await process_document(
