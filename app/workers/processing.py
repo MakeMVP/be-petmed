@@ -100,6 +100,7 @@ async def process_document(
             sk=f"DOC#{doc_id}",
             updates={
                 "status": DocumentStatus.COMPLETED.value,
+                "error_message": "",
                 "page_count": extracted.page_count,
                 "chunk_count": len(chunks),
                 "metadata": {
