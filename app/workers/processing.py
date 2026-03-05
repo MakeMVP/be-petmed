@@ -124,19 +124,19 @@ async def process_document(
         }
 
     except Exception as e:
-        logger.error("Document processing failed", doc_id=doc_id, error=str(e))
+        logger.error("Document processing failed", doc_id=doc_id, error=str(e), exc_info=True)
         await db.update_item(
             pk=f"USER#{user_id}",
             sk=f"DOC#{doc_id}",
             updates={
                 "status": DocumentStatus.FAILED.value,
-                "error_message": str(e),
+                "error_message": "Document processing failed. Please try again or contact support.",
             },
         )
         return {
             "doc_id": doc_id,
             "status": "failed",
-            "error": str(e),
+            "error": "Document processing failed.",
         }
 
 
@@ -180,11 +180,11 @@ async def delete_document_data(
         }
 
     except Exception as e:
-        logger.error("Document deletion failed", doc_id=doc_id, error=str(e))
+        logger.error("Document deletion failed", doc_id=doc_id, error=str(e), exc_info=True)
         return {
             "doc_id": doc_id,
             "status": "failed",
-            "error": str(e),
+            "error": "Document deletion failed.",
         }
 
 
@@ -194,31 +194,49 @@ async def reprocess_document(
     s3_key: str,
     filename: str,
 ) -> dict[str, Any]:
-    """Reprocess an existing document."""
+    """Reprocess an existing document.
+
+    Deletes old Pinecone vectors first (brief no-vectors window is safer than
+    duplicates which cause contradictory RAG results), then processes new chunks,
+    then cleans up old DynamoDB chunk records on success.
+    """
     logger.info("Starting document reprocessing", doc_id=doc_id)
 
     db = get_dynamodb_client()
     pinecone = get_pinecone_service()
 
     try:
-        chunks, _ = await db.query(
+        # Collect old chunk data before reprocessing
+        old_chunks, _ = await db.query(
             pk=f"DOC#{doc_id}",
             sk_begins_with="CHUNK#",
         )
 
-        if chunks:
-            chunk_keys = [(c["PK"], c["SK"]) for c in chunks]
-            await db.batch_delete(chunk_keys)
+        # Delete old Pinecone vectors first to avoid duplicate RAG results
+        if old_chunks:
+            old_chunk_ids = [c["chunk_id"] for c in old_chunks]
+            await pinecone.delete_vectors(ids=old_chunk_ids)
 
-            chunk_ids = [c["chunk_id"] for c in chunks]
-            await pinecone.delete_vectors(ids=chunk_ids)
+        # Process new chunks
+        result = await process_document(doc_id, user_id, s3_key, filename)
 
-        return await process_document(doc_id, user_id, s3_key, filename)
+        # Clean up old DynamoDB chunk records on success
+        if result.get("status") == "completed" and old_chunks:
+            old_chunk_keys = [(c["PK"], c["SK"]) for c in old_chunks]
+            await db.batch_delete(old_chunk_keys)
+
+            logger.info(
+                "Cleaned up old chunks after reprocessing",
+                doc_id=doc_id,
+                old_chunks=len(old_chunks),
+            )
+
+        return result
 
     except Exception as e:
-        logger.error("Document reprocessing failed", doc_id=doc_id, error=str(e))
+        logger.error("Document reprocessing failed", doc_id=doc_id, error=str(e), exc_info=True)
         return {
             "doc_id": doc_id,
             "status": "failed",
-            "error": str(e),
+            "error": "Document reprocessing failed. Please try again.",
         }

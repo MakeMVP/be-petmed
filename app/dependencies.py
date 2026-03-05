@@ -91,8 +91,10 @@ class ServiceContainer:
             return
 
         # Initialize singletons
-        get_dynamodb_client()
-        get_storage_service()
+        db = get_dynamodb_client()
+        await db.connect()
+        storage = get_storage_service()
+        await storage.connect()
         try:
             get_gemini_service()
         except Exception as e:
@@ -108,6 +110,14 @@ class ServiceContainer:
     @classmethod
     async def shutdown(cls) -> None:
         """Cleanup services on shutdown."""
-        # Services use connection pooling managed by their clients
-        # No explicit cleanup needed for current implementation
+        storage = get_storage_service()
+        await storage.close()
+        db = get_dynamodb_client()
+        await db.close()
+        # Clear lru_cache so re-initialize creates fresh instances
+        get_dynamodb_client.cache_clear()
+        get_storage_service.cache_clear()
+        get_gemini_service.cache_clear()
+        get_embedding_service.cache_clear()
+        get_pinecone_service.cache_clear()
         cls._initialized = False

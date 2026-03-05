@@ -66,6 +66,15 @@ def create_app() -> FastAPI:
     # Register routers
     _register_routers(app)
 
+    @app.get("/", include_in_schema=False)
+    async def root() -> dict[str, str]:
+        """Root endpoint redirecting to docs."""
+        return {
+            "message": f"Welcome to {settings.app_name}",
+            "version": settings.app_version,
+            "docs": "/docs",
+        }
+
     return app
 
 
@@ -79,13 +88,3 @@ def _register_routers(app: FastAPI) -> None:
 
 # Create the app instance
 app = create_app()
-
-
-@app.get("/", include_in_schema=False)
-async def root() -> dict[str, str]:
-    """Root endpoint redirecting to docs."""
-    return {
-        "message": f"Welcome to {settings.app_name}",
-        "version": settings.app_version,
-        "docs": "/docs",
-    }

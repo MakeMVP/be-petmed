@@ -4,10 +4,14 @@ import asyncio
 from typing import Any
 
 from app.core.logging import get_logger, setup_logging
+from app.db.dynamodb import get_dynamodb_client
+from app.services.storage_service import get_storage_service
 from app.workers.processing import delete_document_data, process_document, reprocess_document
 
 setup_logging()
 logger = get_logger(__name__)
+
+_cold_start = True
 
 
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
@@ -22,7 +26,14 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             "filename": "..."  # required for process/reprocess
         }
     """
-    logger.info("Lambda invoked", action=event.get("action"), doc_id=event.get("doc_id"))
+    global _cold_start
+    logger.info(
+        "Lambda invoked",
+        action=event.get("action"),
+        doc_id=event.get("doc_id"),
+        cold_start=_cold_start,
+    )
+    _cold_start = False
 
     action = event.get("action")
     if not action:
@@ -51,6 +62,12 @@ async def _dispatch(event: dict[str, Any]) -> dict[str, Any]:
 
     if action in ("process", "reprocess") and "filename" not in event:
         return {"status": "error", "error": f"Missing required field: 'filename' for action '{action}'"}
+
+    # Connect services — idempotent, reuses connections on warm starts
+    db = get_dynamodb_client()
+    await db.connect()
+    storage = get_storage_service()
+    await storage.connect()
 
     if action == "process":
         return await process_document(
