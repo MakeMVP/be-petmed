@@ -4,6 +4,7 @@ import asyncio
 import functools
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any, TypeVar
 
 from boto3.dynamodb.conditions import Key
@@ -17,6 +18,17 @@ logger = get_logger(__name__)
 
 T = TypeVar("T")
 _serializer = TypeSerializer()
+
+
+def _sanitize_floats(value: Any) -> Any:
+    """Recursively convert float → Decimal (DynamoDB rejects floats)."""
+    if isinstance(value, float):
+        return Decimal(str(value))
+    if isinstance(value, dict):
+        return {k: _sanitize_floats(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_floats(v) for v in value]
+    return value
 
 
 class DynamoDBClient:
@@ -92,7 +104,7 @@ class DynamoDBClient:
         Returns:
             The response from DynamoDB.
         """
-        params: dict[str, Any] = {"Item": item}
+        params: dict[str, Any] = {"Item": _sanitize_floats(item)}
         if condition_expression:
             params["ConditionExpression"] = condition_expression
 
@@ -206,7 +218,7 @@ class DynamoDBClient:
             attr_value = f":val{i}"
             update_parts.append(f"{attr_name} = {attr_value}")
             expression_names[attr_name] = key
-            expression_values[attr_value] = value
+            expression_values[attr_value] = _sanitize_floats(value)
 
         # Always update updated_at timestamp
         update_parts.append("#updated_at = :updated_at")

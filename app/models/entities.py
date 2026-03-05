@@ -2,6 +2,7 @@
 
 import hashlib
 from datetime import UTC, datetime
+from decimal import Decimal
 from enum import Enum
 from typing import Any
 
@@ -48,6 +49,17 @@ def doc_gsi2_pk(doc_id: str) -> str:
 DOC_GSI2_PKS = ["DOC"] + [f"DOC#S{i}" for i in range(GSI2_DOC_SHARDS)]
 
 
+def _sanitize_floats(value: Any) -> Any:
+    """Recursively convert float values to Decimal for DynamoDB compatibility."""
+    if isinstance(value, float):
+        return Decimal(str(value))
+    if isinstance(value, dict):
+        return {k: _sanitize_floats(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_floats(v) for v in value]
+    return value
+
+
 class BaseEntity(BaseModel):
     """Base entity with common fields."""
 
@@ -57,8 +69,8 @@ class BaseEntity(BaseModel):
     def to_dynamodb_item(self) -> dict[str, Any]:
         """Convert to DynamoDB item format."""
         item = self.model_dump(mode="json")
-        # Remove None values
-        return {k: v for k, v in item.items() if v is not None}
+        # Remove None values and convert floats to Decimal (DynamoDB requirement)
+        return {k: _sanitize_floats(v) for k, v in item.items() if v is not None}
 
     @classmethod
     def from_dynamodb_item(cls, item: dict[str, Any]) -> "BaseEntity":

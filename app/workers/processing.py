@@ -1,5 +1,6 @@
 """Document processing functions — used by Lambda only."""
 
+from decimal import Decimal
 from typing import Any
 
 from app.core.logging import get_logger
@@ -103,8 +104,10 @@ async def process_document(
                 "chunk_count": len(chunks),
                 "metadata": {
                     **extracted.metadata,
-                    "avg_quality_score": sum(p.quality_score for p in extracted.pages)
-                    / len(extracted.pages),
+                    "avg_quality_score": Decimal(str(
+                        sum(p.quality_score for p in extracted.pages)
+                        / len(extracted.pages)
+                    )),
                 },
             },
         )
