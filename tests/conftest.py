@@ -83,6 +83,8 @@ def auth_headers(mock_cognito_user) -> dict[str, str]:
 def mock_dynamodb():
     """Mock DynamoDB client."""
     mock = AsyncMock()
+    mock.connect = AsyncMock()
+    mock.close = AsyncMock()
     mock.get_item = AsyncMock(return_value=None)
     mock.put_item = AsyncMock(return_value={})
     mock.update_item = AsyncMock(return_value={})
@@ -90,6 +92,14 @@ def mock_dynamodb():
     mock.query = AsyncMock(return_value=([], None))
     mock.batch_write = AsyncMock()
     mock.batch_delete = AsyncMock()
+    mock.increment_counter = AsyncMock(return_value={})
+    mock.increment_counters = AsyncMock(return_value={})
+    mock.batch_get_items = AsyncMock(return_value=[])
+    mock.query_count = AsyncMock(return_value=0)
+    mock.query_all_keys = AsyncMock(return_value=[])
+    mock.scan = AsyncMock(return_value=([], None))
+    mock.transact_put_and_increment = AsyncMock()
+    mock.query_across_shards = AsyncMock(return_value=([], None))
     return mock
 
 
@@ -263,13 +273,15 @@ def sample_query() -> dict[str, Any]:
 
 
 @pytest.fixture(autouse=True)
-def mock_auth(mock_cognito_user):
-    """Auto-mock authentication for all tests."""
-    from app.core.cognito import CognitoUser
+def mock_auth(app, mock_cognito_user):
+    """Auto-mock authentication for all tests using FastAPI dependency overrides."""
+    from app.core.cognito import CognitoUser, get_current_user
 
-    async def mock_get_current_user(*args, **kwargs):
-        return CognitoUser(**mock_cognito_user)
+    mock_user = CognitoUser(**mock_cognito_user)
 
-    with patch("app.core.cognito.get_current_user", mock_get_current_user):
-        with patch("app.dependencies.get_current_user", mock_get_current_user):
-            yield
+    async def mock_get_current_user():
+        return mock_user
+
+    app.dependency_overrides[get_current_user] = mock_get_current_user
+    yield
+    app.dependency_overrides.pop(get_current_user, None)

@@ -9,12 +9,14 @@ from fastapi.testclient import TestClient
 @pytest.fixture
 def mock_services(mock_dynamodb, mock_storage, mock_gemini, mock_embeddings, mock_pinecone):
     """Mock all external services."""
-    with patch("app.dependencies.get_dynamodb_client", return_value=mock_dynamodb):
-        with patch("app.dependencies.get_storage_service", return_value=mock_storage):
-            with patch("app.dependencies.get_gemini_service", return_value=mock_gemini):
-                with patch("app.dependencies.get_embedding_service", return_value=mock_embeddings):
-                    with patch("app.dependencies.get_pinecone_service", return_value=mock_pinecone):
-                        yield
+    with patch("app.dependencies.get_dynamodb_client", return_value=mock_dynamodb), \
+         patch("app.db.dynamodb.get_dynamodb_client", return_value=mock_dynamodb), \
+         patch("app.api.v1.endpoints.auth.get_dynamodb_client", return_value=mock_dynamodb), \
+         patch("app.dependencies.get_storage_service", return_value=mock_storage), \
+         patch("app.dependencies.get_gemini_service", return_value=mock_gemini), \
+         patch("app.dependencies.get_embedding_service", return_value=mock_embeddings), \
+         patch("app.dependencies.get_pinecone_service", return_value=mock_pinecone):
+        yield
 
 
 def test_root_endpoint(client: TestClient):
