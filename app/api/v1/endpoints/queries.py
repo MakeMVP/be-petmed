@@ -25,6 +25,70 @@ router = APIRouter(prefix="/queries", tags=["Queries"])
 logger = get_logger(__name__)
 
 
+async def _get_conversation_context(
+    db: DynamoDB, conv_id: str, limit: int = 10
+) -> list[dict[str, Any]] | None:
+    """Get recent messages as conversation context for RAG."""
+    messages, _ = await db.query(
+        pk=f"CONV#{conv_id}",
+        sk_begins_with="MSG#",
+        limit=limit,
+        scan_forward=False,  # Most recent first
+    )
+    if not messages:
+        return None
+    # Reverse to chronological order
+    return [{"role": m["role"], "content": m["content"]} for m in reversed(messages)]
+
+
+async def _find_user_query(
+    db: DynamoDB, user_id: str, query_id: str
+) -> dict[str, Any]:
+    """Find a specific query by ID using O(1) index lookup.
+
+    1. Fetch QUERY#{query_id} index item to get conv_id + user_id.
+    2. Verify user_id matches (authorization).
+    3. Fetch full query data from CONV#{conv_id}/QUERY#{query_id}.
+    4. Fallback to old GSI1 scan for pre-migration queries.
+    """
+    # O(1) lookup via query index item
+    index_item = await db.get_item(
+        pk=f"QUERY#{query_id}", sk=f"QUERY#{query_id}"
+    )
+
+    if index_item:
+        # Verify authorization
+        if index_item.get("user_id") != user_id:
+            raise NotFoundError(
+                f"Query not found: {query_id}",
+                resource_type="query",
+                resource_id=query_id,
+            )
+        conv_id = index_item["conv_id"]
+        query = await db.get_item(
+            pk=f"CONV#{conv_id}", sk=f"QUERY#{query_id}"
+        )
+        if query:
+            return query
+
+    # Fallback: GSI1 scan for pre-migration queries without index items
+    queries, _ = await db.query(
+        pk=f"USER#{user_id}",
+        sk_begins_with="QUERY#",
+        index_name="GSI1",
+        limit=200,
+    )
+    for q in queries:
+        if q.get("query_id") == query_id:
+            return q
+
+    raise NotFoundError(
+        f"Query not found: {query_id}",
+        resource_type="query",
+        resource_id=query_id,
+    )
+
+
 @router.post(
     "",
     response_model=QueryResponse,
@@ -43,11 +107,12 @@ async def submit_query(
     """Submit a RAG query and get response."""
     # Get or create conversation
     conv_id = request.conversation_id
+    user_pk = f"USER#{current_user.user_id}"
 
     if conv_id:
         # Verify conversation exists and belongs to user
         conv = await db.get_item(
-            pk=f"USER#{current_user.user_id}",
+            pk=user_pk,
             sk=f"CONV#{conv_id}",
         )
         if not conv:
@@ -64,23 +129,14 @@ async def submit_query(
         )
         await db.put_item(conv.to_dynamodb_item())
         conv_id = conv.conv_id
+        # Increment conversation count for new conversations
+        await db.increment_counter(pk=user_pk, sk=user_pk, counter_attr="conversation_count")
         logger.debug("Created new conversation", conv_id=conv_id)
 
     # Get conversation context if exists
     context = None
     if request.conversation_id:
-        messages, _ = await db.query(
-            pk=f"CONV#{conv_id}",
-            sk_begins_with="MSG#",
-            limit=10,
-            scan_forward=False,  # Most recent first
-        )
-        if messages:
-            # Reverse to chronological order
-            context = [
-                {"role": m["role"], "content": m["content"]}
-                for m in reversed(messages)
-            ]
+        context = await _get_conversation_context(db, conv_id)
 
     # Execute RAG query
     rag = get_rag_service()
@@ -109,15 +165,17 @@ async def submit_query(
     )
     await db.put_item(assistant_msg.to_dynamodb_item())
 
-    # Update conversation
-    await db.update_item(
-        pk=f"USER#{current_user.user_id}",
+    # Atomically increment message_count (avoids race condition)
+    await db.increment_counter(
+        pk=user_pk,
         sk=f"CONV#{conv_id}",
-        updates={
-            "message_count": (conv.get("message_count", 0) if isinstance(conv, dict) else conv.message_count) + 2,
-            "last_message_at": assistant_msg.created_at.isoformat(),
-        },
+        counter_attr="message_count",
+        increment=2,
+        set_updates={"last_message_at": assistant_msg.created_at.isoformat()},
     )
+
+    # Increment user's denormalized query count
+    await db.increment_counter(pk=user_pk, sk=user_pk, counter_attr="query_count")
 
     # Build response
     sources = [
@@ -162,10 +220,11 @@ async def submit_streaming_query(
     """Submit a RAG query with streaming response."""
     # Get or create conversation
     conv_id = request.conversation_id
+    user_pk = f"USER#{current_user.user_id}"
 
     if conv_id:
         conv = await db.get_item(
-            pk=f"USER#{current_user.user_id}",
+            pk=user_pk,
             sk=f"CONV#{conv_id}",
         )
         if not conv:
@@ -181,21 +240,12 @@ async def submit_streaming_query(
         )
         await db.put_item(conv.to_dynamodb_item())
         conv_id = conv.conv_id
+        await db.increment_counter(pk=user_pk, sk=user_pk, counter_attr="conversation_count")
 
     # Get conversation context
     context = None
     if request.conversation_id:
-        messages, _ = await db.query(
-            pk=f"CONV#{conv_id}",
-            sk_begins_with="MSG#",
-            limit=10,
-            scan_forward=False,
-        )
-        if messages:
-            context = [
-                {"role": m["role"], "content": m["content"]}
-                for m in reversed(messages)
-            ]
+        context = await _get_conversation_context(db, conv_id)
 
     # Store user message
     user_msg = Message(
@@ -230,13 +280,25 @@ async def submit_streaming_query(
             )
             await db.put_item(assistant_msg.to_dynamodb_item())
 
+            # Atomically increment message_count
+            await db.increment_counter(
+                pk=user_pk,
+                sk=f"CONV#{conv_id}",
+                counter_attr="message_count",
+                increment=2,
+                set_updates={"last_message_at": assistant_msg.created_at.isoformat()},
+            )
+
+            # Increment query count
+            await db.increment_counter(pk=user_pk, sk=user_pk, counter_attr="query_count")
+
             # Send done event
             event = {"type": "done", "conversation_id": conv_id}
             yield f"data: {json.dumps(event)}\n\n"
 
         except Exception as e:
-            logger.error("Streaming query failed", error=str(e))
-            event = {"type": "error", "error": str(e)}
+            logger.error("Streaming query failed", error=str(e), exc_info=True)
+            event = {"type": "error", "error": "Query processing failed. Please try again."}
             yield f"data: {json.dumps(event)}\n\n"
 
     return StreamingResponse(
@@ -266,26 +328,7 @@ async def get_query(
     db: DynamoDB,
 ) -> QueryResponse:
     """Get query result by ID."""
-    # Query uses GSI1 with USER#{user_id} as PK
-    queries, _ = await db.query(
-        pk=f"USER#{current_user.user_id}",
-        sk_begins_with=f"QUERY#",
-        index_name="GSI1",
-    )
-
-    # Find the specific query
-    query = None
-    for q in queries:
-        if q.get("query_id") == query_id:
-            query = q
-            break
-
-    if not query:
-        raise NotFoundError(
-            f"Query not found: {query_id}",
-            resource_type="query",
-            resource_id=query_id,
-        )
+    query = await _find_user_query(db, current_user.user_id, query_id)
 
     sources = [
         SourceResponse(
@@ -328,25 +371,7 @@ async def submit_feedback(
     db: DynamoDB,
 ) -> FeedbackResponse:
     """Submit feedback for a query."""
-    # Find the query (need to search since we don't know conv_id)
-    queries, _ = await db.query(
-        pk=f"USER#{current_user.user_id}",
-        sk_begins_with="QUERY#",
-        index_name="GSI1",
-    )
-
-    query = None
-    for q in queries:
-        if q.get("query_id") == query_id:
-            query = q
-            break
-
-    if not query:
-        raise NotFoundError(
-            f"Query not found: {query_id}",
-            resource_type="query",
-            resource_id=query_id,
-        )
+    query = await _find_user_query(db, current_user.user_id, query_id)
 
     # Update with feedback
     rag = get_rag_service()

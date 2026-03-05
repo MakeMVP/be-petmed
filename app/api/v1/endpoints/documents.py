@@ -1,8 +1,10 @@
 """Document upload and management endpoints."""
 
+from urllib.parse import quote
+
 from fastapi import APIRouter, File, Form, UploadFile
 
-from app.api.v1.schemas.common import DeleteResponse, ERROR_RESPONSES, PaginationParams
+from app.api.v1.schemas.common import DeleteResponse, ERROR_RESPONSES
 from app.api.v1.schemas.documents import (
     ChunkListResponse,
     ChunkResponse,
@@ -15,12 +17,23 @@ from app.api.v1.schemas.documents import (
 from app.config import settings
 from app.core.exceptions import BadRequestError, NotFoundError
 from app.core.logging import get_logger
+from app.db.pagination import decode_cursor, encode_cursor
 from app.dependencies import CurrentUser, DynamoDB, Storage
 from app.models.entities import Document, DocumentStatus
 from app.workers.tasks import enqueue_document_deletion, enqueue_document_processing
 
 router = APIRouter(prefix="/documents", tags=["Documents"])
 logger = get_logger(__name__)
+
+
+async def _get_download_url(doc: dict, storage: Storage) -> str | None:
+    """Generate presigned download URL if document is completed."""
+    if doc.get("status") != DocumentStatus.COMPLETED.value:
+        return None
+    return await storage.generate_presigned_url(
+        s3_key=doc["s3_key"],
+        for_upload=False,
+    )
 
 
 @router.post(
@@ -72,8 +85,6 @@ async def upload_document(
     )
 
     # Generate S3 key (use doc_id for safe ASCII key)
-    from urllib.parse import quote
-
     s3_key = f"documents/{current_user.user_id}/{doc.doc_id}/{doc.doc_id}.pdf"
     doc.s3_key = s3_key
 
@@ -89,8 +100,14 @@ async def upload_document(
         },
     )
 
-    # Save document record
-    await db.put_item(doc.to_dynamodb_item())
+    # Atomically write document + increment counters in one transaction
+    user_pk = f"USER#{current_user.user_id}"
+    await db.transact_put_and_increment(
+        item=doc.to_dynamodb_item(),
+        counter_pk=user_pk,
+        counter_sk=user_pk,
+        counters={"document_count": 1, "storage_used_bytes": file_size},
+    )
 
     # Enqueue processing task
     job_id = await enqueue_document_processing(
@@ -132,48 +149,24 @@ async def list_documents(
     cursor: str | None = None,
 ) -> DocumentListResponse:
     """List user's documents."""
-    # Parse cursor if provided
-    exclusive_start_key = None
-    if cursor:
-        import base64
-        import json
-
-        try:
-            exclusive_start_key = json.loads(base64.b64decode(cursor))
-        except Exception:
-            raise BadRequestError("Invalid cursor")
+    exclusive_start_key = decode_cursor(cursor)
 
     # Query documents
     docs, last_key = await db.query(
         pk=f"USER#{current_user.user_id}",
         sk_begins_with="DOC#",
-        limit=limit + 1,  # Fetch one extra to check for more
+        limit=limit,
         exclusive_start_key=exclusive_start_key,
         scan_forward=False,  # Most recent first
     )
 
-    # Check if there are more
-    has_more = len(docs) > limit
-    if has_more:
-        docs = docs[:limit]
-
-    # Build next cursor
-    next_cursor = None
-    if last_key and has_more:
-        import base64
-        import json
-
-        next_cursor = base64.b64encode(json.dumps(last_key).encode()).decode()
+    has_more = last_key is not None
+    next_cursor = encode_cursor(last_key)
 
     # Generate download URLs
     items = []
     for doc in docs:
-        download_url = None
-        if doc.get("status") == DocumentStatus.COMPLETED.value:
-            download_url = await storage.generate_presigned_url(
-                s3_key=doc["s3_key"],
-                for_upload=False,
-            )
+        download_url = await _get_download_url(doc, storage)
 
         items.append(
             DocumentResponse(
@@ -229,13 +222,7 @@ async def get_document(
             resource_id=doc_id,
         )
 
-    # Generate download URL if completed
-    download_url = None
-    if doc.get("status") == DocumentStatus.COMPLETED.value:
-        download_url = await storage.generate_presigned_url(
-            s3_key=doc["s3_key"],
-            for_upload=False,
-        )
+    download_url = await _get_download_url(doc, storage)
 
     return DocumentResponse(
         doc_id=doc["doc_id"],
@@ -332,35 +319,18 @@ async def get_document_chunks(
             resource_id=doc_id,
         )
 
-    # Parse cursor
-    exclusive_start_key = None
-    if cursor:
-        import base64
-        import json
-
-        try:
-            exclusive_start_key = json.loads(base64.b64decode(cursor))
-        except Exception:
-            raise BadRequestError("Invalid cursor")
+    exclusive_start_key = decode_cursor(cursor)
 
     # Query chunks
     chunks, last_key = await db.query(
         pk=f"DOC#{doc_id}",
         sk_begins_with="CHUNK#",
-        limit=limit + 1,
+        limit=limit,
         exclusive_start_key=exclusive_start_key,
     )
 
-    has_more = len(chunks) > limit
-    if has_more:
-        chunks = chunks[:limit]
-
-    next_cursor = None
-    if last_key and has_more:
-        import base64
-        import json
-
-        next_cursor = base64.b64encode(json.dumps(last_key).encode()).decode()
+    has_more = last_key is not None
+    next_cursor = encode_cursor(last_key)
 
     items = [
         ChunkResponse(
@@ -422,12 +392,7 @@ async def update_document(
             updates=updates,
         )
 
-    download_url = None
-    if doc.get("status") == DocumentStatus.COMPLETED.value:
-        download_url = await storage.generate_presigned_url(
-            s3_key=doc["s3_key"],
-            for_upload=False,
-        )
+    download_url = await _get_download_url(doc, storage)
 
     return DocumentResponse(
         doc_id=doc["doc_id"],
@@ -480,6 +445,15 @@ async def delete_document(
         doc_id=doc_id,
         user_id=current_user.user_id,
         s3_key=doc["s3_key"],
+    )
+
+    # Atomically decrement user's denormalized document count and storage
+    user_pk = f"USER#{current_user.user_id}"
+    file_size = doc.get("file_size", 0)
+    await db.increment_counters(
+        pk=user_pk,
+        sk=user_pk,
+        counters={"document_count": -1, "storage_used_bytes": -file_size},
     )
 
     logger.info("Document deletion started", doc_id=doc_id)

@@ -1,12 +1,12 @@
 """Authentication endpoints."""
 
-import boto3
 from botocore.exceptions import ClientError
 from fastapi import APIRouter
 
 from app.api.v1.schemas.auth import TokenRefreshRequest, TokenResponse, UserResponse
 from app.api.v1.schemas.common import ERROR_RESPONSES
 from app.config import settings
+from app.core.aws import get_aioboto3_session
 from app.core.cognito import CurrentUser
 from app.core.exceptions import BadRequestError, UnauthorizedError
 from app.core.logging import get_logger
@@ -76,15 +76,15 @@ async def get_current_user_profile(current_user: CurrentUser) -> UserResponse:
 async def refresh_token(request: TokenRefreshRequest) -> TokenResponse:
     """Refresh access token using Cognito refresh token."""
     try:
-        client = boto3.client("cognito-idp", region_name=settings.aws_region)
-
-        response = client.initiate_auth(
-            ClientId=settings.cognito_client_id,
-            AuthFlow="REFRESH_TOKEN_AUTH",
-            AuthParameters={
-                "REFRESH_TOKEN": request.refresh_token,
-            },
-        )
+        session = get_aioboto3_session()
+        async with session.client("cognito-idp", region_name=settings.aws_region) as client:
+            response = await client.initiate_auth(
+                ClientId=settings.cognito_client_id,
+                AuthFlow="REFRESH_TOKEN_AUTH",
+                AuthParameters={
+                    "REFRESH_TOKEN": request.refresh_token,
+                },
+            )
 
         auth_result = response.get("AuthenticationResult", {})
 

@@ -11,6 +11,7 @@ from app.api.v1.schemas.users import (
 from app.core.exceptions import NotFoundError
 from app.core.logging import get_logger
 from app.dependencies import CurrentUser, DynamoDB, Storage, VectorDB
+from app.services.user_service import delete_user_data
 
 router = APIRouter(prefix="/users", tags=["Users"])
 logger = get_logger(__name__)
@@ -118,31 +119,23 @@ async def get_user_stats(
     current_user: CurrentUser,
     db: DynamoDB,
 ) -> UserStatsResponse:
-    """Get user usage statistics."""
+    """Get user usage statistics from denormalized counts on User entity."""
     user_pk = f"USER#{current_user.user_id}"
+    user = await db.get_item(pk=user_pk, sk=user_pk)
 
-    # Count documents
-    docs, _ = await db.query(pk=user_pk, sk_begins_with="DOC#")
-    doc_count = len(docs)
-    storage_used = sum(d.get("file_size", 0) for d in docs)
-
-    # Count conversations
-    convs, _ = await db.query(pk=user_pk, sk_begins_with="CONV#")
-    conv_count = len(convs)
-
-    # Count queries (via GSI)
-    queries, _ = await db.query(
-        pk=user_pk,
-        sk_begins_with="QUERY#",
-        index_name="GSI1",
-    )
-    query_count = len(queries)
+    if not user:
+        return UserStatsResponse(
+            document_count=0,
+            conversation_count=0,
+            query_count=0,
+            storage_used_bytes=0,
+        )
 
     return UserStatsResponse(
-        document_count=doc_count,
-        conversation_count=conv_count,
-        query_count=query_count,
-        storage_used_bytes=storage_used,
+        document_count=user.get("document_count", 0),
+        conversation_count=user.get("conversation_count", 0),
+        query_count=user.get("query_count", 0),
+        storage_used_bytes=user.get("storage_used_bytes", 0),
     )
 
 
@@ -161,58 +154,15 @@ async def delete_account(
     storage: Storage,
     vector_db: VectorDB,
 ) -> DeleteResponse:
-    """Delete user account and all associated data."""
-    user_pk = f"USER#{current_user.user_id}"
-
-    # Get all documents
-    docs, _ = await db.query(pk=user_pk, sk_begins_with="DOC#")
-
-    # Delete S3 files and collect doc IDs
-    for doc in docs:
-        s3_key = doc.get("s3_key")
-        if s3_key:
-            await storage.delete_file(s3_key)
-
-    # Delete all vectors for this user
-    await vector_db.delete_vectors(
-        filter_dict={"user_id": current_user.user_id}
+    """Delete user account and all associated data via shared service."""
+    items_deleted = await delete_user_data(
+        current_user.user_id, db, storage, vector_db
     )
-
-    # Get all conversations
-    convs, _ = await db.query(pk=user_pk, sk_begins_with="CONV#")
-
-    # Collect all items to delete
-    items_to_delete = [(user_pk, user_pk)]  # User record
-
-    # Add documents
-    for doc in docs:
-        items_to_delete.append((doc["PK"], doc["SK"]))
-        # Get chunks for this doc
-        doc_id = doc["doc_id"]
-        chunks, _ = await db.query(pk=f"DOC#{doc_id}", sk_begins_with="CHUNK#")
-        for chunk in chunks:
-            items_to_delete.append((chunk["PK"], chunk["SK"]))
-
-    # Add conversations and messages
-    for conv in convs:
-        items_to_delete.append((conv["PK"], conv["SK"]))
-        conv_id = conv["conv_id"]
-        # Get messages
-        messages, _ = await db.query(pk=f"CONV#{conv_id}", sk_begins_with="MSG#")
-        for msg in messages:
-            items_to_delete.append((msg["PK"], msg["SK"]))
-        # Get queries
-        queries, _ = await db.query(pk=f"CONV#{conv_id}", sk_begins_with="QUERY#")
-        for query in queries:
-            items_to_delete.append((query["PK"], query["SK"]))
-
-    # Batch delete all items
-    await db.batch_delete(items_to_delete)
 
     logger.info(
         "Deleted user account",
         user_id=current_user.user_id,
-        items_deleted=len(items_to_delete),
+        items_deleted=items_deleted,
     )
 
     return DeleteResponse(

@@ -1,8 +1,5 @@
 """Conversation management endpoints."""
 
-import base64
-import json
-
 from fastapi import APIRouter
 
 from app.api.v1.schemas.common import DeleteResponse, ERROR_RESPONSES
@@ -15,8 +12,9 @@ from app.api.v1.schemas.conversations import (
     MessageResponse,
     UpdateConversationRequest,
 )
-from app.core.exceptions import BadRequestError, NotFoundError
+from app.core.exceptions import NotFoundError
 from app.core.logging import get_logger
+from app.db.pagination import decode_cursor, encode_cursor
 from app.dependencies import CurrentUser, DynamoDB
 from app.models.entities import Conversation, MessageRole
 
@@ -47,6 +45,10 @@ async def create_conversation(
 
     await db.put_item(conv.to_dynamodb_item())
 
+    # Increment user's denormalized conversation count
+    user_pk = f"USER#{current_user.user_id}"
+    await db.increment_counter(pk=user_pk, sk=user_pk, counter_attr="conversation_count")
+
     logger.info("Created conversation", conv_id=conv.conv_id)
 
     return ConversationResponse(
@@ -75,28 +77,18 @@ async def list_conversations(
     cursor: str | None = None,
 ) -> ConversationListResponse:
     """List user's conversations."""
-    exclusive_start_key = None
-    if cursor:
-        try:
-            exclusive_start_key = json.loads(base64.b64decode(cursor))
-        except Exception:
-            raise BadRequestError("Invalid cursor")
+    exclusive_start_key = decode_cursor(cursor)
 
     convs, last_key = await db.query(
         pk=f"USER#{current_user.user_id}",
         sk_begins_with="CONV#",
-        limit=limit + 1,
+        limit=limit,
         exclusive_start_key=exclusive_start_key,
         scan_forward=False,  # Most recent first
     )
 
-    has_more = len(convs) > limit
-    if has_more:
-        convs = convs[:limit]
-
-    next_cursor = None
-    if last_key and has_more:
-        next_cursor = base64.b64encode(json.dumps(last_key).encode()).decode()
+    has_more = last_key is not None
+    next_cursor = encode_cursor(last_key)
 
     items = [
         ConversationResponse(
@@ -207,28 +199,18 @@ async def get_messages(
             resource_id=conv_id,
         )
 
-    exclusive_start_key = None
-    if cursor:
-        try:
-            exclusive_start_key = json.loads(base64.b64decode(cursor))
-        except Exception:
-            raise BadRequestError("Invalid cursor")
+    exclusive_start_key = decode_cursor(cursor)
 
     messages, last_key = await db.query(
         pk=f"CONV#{conv_id}",
         sk_begins_with="MSG#",
-        limit=limit + 1,
+        limit=limit,
         exclusive_start_key=exclusive_start_key,
         scan_forward=True,
     )
 
-    has_more = len(messages) > limit
-    if has_more:
-        messages = messages[:limit]
-
-    next_cursor = None
-    if last_key and has_more:
-        next_cursor = base64.b64encode(json.dumps(last_key).encode()).decode()
+    has_more = last_key is not None
+    next_cursor = encode_cursor(last_key)
 
     items = [
         MessageResponse(
@@ -324,37 +306,40 @@ async def delete_conversation(
             resource_id=conv_id,
         )
 
-    # Get all messages
-    messages, _ = await db.query(
-        pk=f"CONV#{conv_id}",
-        sk_begins_with="MSG#",
+    # Get all message and query keys (paginated to handle >1MB)
+    msg_keys = await db.query_all_keys(
+        pk=f"CONV#{conv_id}", sk_begins_with="MSG#"
     )
-
-    # Get all queries
-    queries, _ = await db.query(
-        pk=f"CONV#{conv_id}",
-        sk_begins_with="QUERY#",
+    query_keys = await db.query_all_keys(
+        pk=f"CONV#{conv_id}", sk_begins_with="QUERY#"
     )
 
     # Collect all items to delete
-    items_to_delete = [
+    items_to_delete: list[tuple[str, str]] = [
         (f"USER#{current_user.user_id}", f"CONV#{conv_id}"),
     ]
+    items_to_delete.extend(msg_keys)
+    items_to_delete.extend(query_keys)
 
-    for m in messages:
-        items_to_delete.append((m["PK"], m["SK"]))
-
-    for q in queries:
-        items_to_delete.append((q["PK"], q["SK"]))
+    # Clean up query index items (PK=QUERY#{query_id})
+    for _pk, sk in query_keys:
+        query_id = sk.removeprefix("QUERY#")
+        items_to_delete.append((f"QUERY#{query_id}", f"QUERY#{query_id}"))
 
     # Batch delete
     await db.batch_delete(items_to_delete)
 
+    # Decrement user's denormalized conversation count
+    user_pk = f"USER#{current_user.user_id}"
+    await db.increment_counter(
+        pk=user_pk, sk=user_pk, counter_attr="conversation_count", increment=-1
+    )
+
     logger.info(
         "Deleted conversation",
         conv_id=conv_id,
-        messages=len(messages),
-        queries=len(queries),
+        messages=len(msg_keys),
+        queries=len(query_keys),
     )
 
     return DeleteResponse(

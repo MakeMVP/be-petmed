@@ -1,9 +1,9 @@
 """Admin management endpoints."""
 
-import base64
-import json
+import asyncio
+from datetime import UTC, datetime, timedelta
+from urllib.parse import quote
 
-from boto3.dynamodb.conditions import Attr
 from fastapi import APIRouter, File, Form, UploadFile
 
 from app.api.v1.schemas.admin import (
@@ -24,8 +24,10 @@ from app.config import settings
 from app.core.admin_auth import AdminUser
 from app.core.exceptions import BadRequestError, NotFoundError
 from app.core.logging import get_logger
+from app.db.pagination import decode_cursor, encode_cursor
 from app.dependencies import DynamoDB, Storage, VectorDB
-from app.models.entities import Document, DocumentStatus, MessageRole
+from app.models.entities import DOC_GSI2_PKS, Document, DocumentStatus, MessageRole
+from app.services.user_service import delete_user_data
 from app.workers.tasks import enqueue_document_processing
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
@@ -51,59 +53,42 @@ async def list_users(
     limit: int = 20,
     cursor: str | None = None,
 ) -> AdminUserListResponse:
-    """List all users via GSI1."""
-    exclusive_start_key = None
-    if cursor:
-        try:
-            exclusive_start_key = json.loads(base64.b64decode(cursor))
-        except Exception:
-            raise BadRequestError("Invalid cursor")
+    """List all users via GSI1 — uses denormalized counts instead of N+1 queries."""
+    exclusive_start_key = decode_cursor(cursor)
 
     users, last_key = await db.query(
         pk="USER#EMAIL",
         index_name="GSI1",
-        limit=limit + 1,
+        limit=limit,
         exclusive_start_key=exclusive_start_key,
         scan_forward=True,
     )
 
-    has_more = len(users) > limit
-    if has_more:
-        users = users[:limit]
-
-    next_cursor = None
-    if last_key and has_more:
-        next_cursor = base64.b64encode(json.dumps(last_key).encode()).decode()
-
-    items = []
-    for u in users:
-        user_settings = u.get("settings", {})
-        user_pk = f"USER#{u['user_id']}"
-
-        # Count documents and conversations
-        docs, _ = await db.query(pk=user_pk, sk_begins_with="DOC#")
-        convs, _ = await db.query(pk=user_pk, sk_begins_with="CONV#")
-
-        items.append(
-            AdminUserResponse(
-                user_id=u["user_id"],
-                email=u["email"],
-                name=u.get("name"),
-                avatar_url=u.get("avatar_url"),
-                is_active=user_settings.get("is_active", True),
-                role=user_settings.get("role", "user"),
-                message_limit=user_settings.get("message_limit", 50),
-                document_count=len(docs),
-                conversation_count=len(convs),
-                created_at=u["created_at"],
-                updated_at=u["updated_at"],
-            )
-        )
+    has_more = last_key is not None
+    next_cursor = encode_cursor(last_key)
 
     return AdminUserListResponse(
-        items=items,
+        items=[_build_admin_user_response(u) for u in users],
         next_cursor=next_cursor,
         has_more=has_more,
+    )
+
+
+def _build_admin_user_response(user: dict) -> AdminUserResponse:
+    """Build AdminUserResponse from a DynamoDB user item using denormalized counts."""
+    user_settings = user.get("settings", {})
+    return AdminUserResponse(
+        user_id=user["user_id"],
+        email=user["email"],
+        name=user.get("name"),
+        avatar_url=user.get("avatar_url"),
+        is_active=user_settings.get("is_active", True),
+        role=user_settings.get("role", "user"),
+        message_limit=user_settings.get("message_limit", 50),
+        document_count=user.get("document_count", 0),
+        conversation_count=user.get("conversation_count", 0),
+        created_at=user["created_at"],
+        updated_at=user["updated_at"],
     )
 
 
@@ -123,7 +108,7 @@ async def get_user(
     admin: AdminUser,
     db: DynamoDB,
 ) -> AdminUserResponse:
-    """Get any user's details."""
+    """Get any user's details — uses denormalized counts."""
     pk = f"USER#{user_id}"
     user = await db.get_item(pk=pk, sk=pk)
 
@@ -134,25 +119,7 @@ async def get_user(
             resource_id=user_id,
         )
 
-    user_settings = user.get("settings", {})
-
-    # Count documents and conversations
-    docs, _ = await db.query(pk=pk, sk_begins_with="DOC#")
-    convs, _ = await db.query(pk=pk, sk_begins_with="CONV#")
-
-    return AdminUserResponse(
-        user_id=user["user_id"],
-        email=user["email"],
-        name=user.get("name"),
-        avatar_url=user.get("avatar_url"),
-        is_active=user_settings.get("is_active", True),
-        role=user_settings.get("role", "user"),
-        message_limit=user_settings.get("message_limit", 50),
-        document_count=len(docs),
-        conversation_count=len(convs),
-        created_at=user["created_at"],
-        updated_at=user["updated_at"],
-    )
+    return _build_admin_user_response(user)
 
 
 @router.patch(
@@ -200,23 +167,7 @@ async def update_user(
 
     logger.info("Admin updated user", user_id=user_id, admin_id=admin.user_id)
 
-    updated_settings = updated.get("settings", {})
-    docs, _ = await db.query(pk=pk, sk_begins_with="DOC#")
-    convs, _ = await db.query(pk=pk, sk_begins_with="CONV#")
-
-    return AdminUserResponse(
-        user_id=updated["user_id"],
-        email=updated["email"],
-        name=updated.get("name"),
-        avatar_url=updated.get("avatar_url"),
-        is_active=updated_settings.get("is_active", True),
-        role=updated_settings.get("role", "user"),
-        message_limit=updated_settings.get("message_limit", 50),
-        document_count=len(docs),
-        conversation_count=len(convs),
-        created_at=updated["created_at"],
-        updated_at=updated["updated_at"],
-    )
+    return _build_admin_user_response(updated)
 
 
 @router.delete(
@@ -237,7 +188,7 @@ async def delete_user(
     storage: Storage,
     vector_db: VectorDB,
 ) -> DeleteResponse:
-    """Delete a user and all associated data."""
+    """Delete a user and all associated data via shared service."""
     user_pk = f"USER#{user_id}"
 
     user = await db.get_item(pk=user_pk, sk=user_pk)
@@ -248,48 +199,13 @@ async def delete_user(
             resource_id=user_id,
         )
 
-    # Get all documents
-    docs, _ = await db.query(pk=user_pk, sk_begins_with="DOC#")
-
-    # Delete S3 files
-    for doc in docs:
-        s3_key = doc.get("s3_key")
-        if s3_key:
-            await storage.delete_file(s3_key)
-
-    # Delete all vectors for this user
-    await vector_db.delete_vectors(filter_dict={"user_id": user_id})
-
-    # Get all conversations
-    convs, _ = await db.query(pk=user_pk, sk_begins_with="CONV#")
-
-    # Collect all items to delete
-    items_to_delete = [(user_pk, user_pk)]
-
-    for doc in docs:
-        items_to_delete.append((doc["PK"], doc["SK"]))
-        doc_id = doc["doc_id"]
-        chunks, _ = await db.query(pk=f"DOC#{doc_id}", sk_begins_with="CHUNK#")
-        for chunk in chunks:
-            items_to_delete.append((chunk["PK"], chunk["SK"]))
-
-    for conv in convs:
-        items_to_delete.append((conv["PK"], conv["SK"]))
-        conv_id = conv["conv_id"]
-        messages, _ = await db.query(pk=f"CONV#{conv_id}", sk_begins_with="MSG#")
-        for msg in messages:
-            items_to_delete.append((msg["PK"], msg["SK"]))
-        queries, _ = await db.query(pk=f"CONV#{conv_id}", sk_begins_with="QUERY#")
-        for query in queries:
-            items_to_delete.append((query["PK"], query["SK"]))
-
-    await db.batch_delete(items_to_delete)
+    items_deleted = await delete_user_data(user_id, db, storage, vector_db)
 
     logger.info(
         "Admin deleted user",
         user_id=user_id,
         admin_id=admin.user_id,
-        items_deleted=len(items_to_delete),
+        items_deleted=items_deleted,
     )
 
     return DeleteResponse(success=True, deleted_id=user_id)
@@ -327,28 +243,18 @@ async def list_user_conversations(
             resource_id=user_id,
         )
 
-    exclusive_start_key = None
-    if cursor:
-        try:
-            exclusive_start_key = json.loads(base64.b64decode(cursor))
-        except Exception:
-            raise BadRequestError("Invalid cursor")
+    exclusive_start_key = decode_cursor(cursor)
 
     convs, last_key = await db.query(
         pk=user_pk,
         sk_begins_with="CONV#",
-        limit=limit + 1,
+        limit=limit,
         exclusive_start_key=exclusive_start_key,
         scan_forward=False,
     )
 
-    has_more = len(convs) > limit
-    if has_more:
-        convs = convs[:limit]
-
-    next_cursor = None
-    if last_key and has_more:
-        next_cursor = base64.b64encode(json.dumps(last_key).encode()).decode()
+    has_more = last_key is not None
+    next_cursor = encode_cursor(last_key)
 
     items = [
         AdminConversationResponse(
@@ -450,55 +356,48 @@ async def list_all_documents(
     limit: int = 20,
     cursor: str | None = None,
 ) -> AdminDocumentListResponse:
-    """List all documents via scan with entity_type filter."""
-    exclusive_start_key = None
-    if cursor:
-        try:
-            exclusive_start_key = json.loads(base64.b64decode(cursor))
-        except Exception:
-            raise BadRequestError("Invalid cursor")
+    """List all documents via sharded GSI2 (avoids hot partition)."""
+    raw_cursor = decode_cursor(cursor)
+    shard_cursor = raw_cursor if raw_cursor and "s" in raw_cursor else None
 
-    docs, last_key = await db.scan(
-        filter_expression=Attr("entity_type").eq("DOC"),
-        limit=limit + 1,
-        exclusive_start_key=exclusive_start_key,
+    docs, next_shard_state = await db.query_across_shards(
+        shard_pks=DOC_GSI2_PKS,
+        index_name="GSI2",
+        limit=limit,
+        cursor=shard_cursor,
+        scan_forward=False,  # Most recent first
     )
 
-    has_more = len(docs) > limit
-    if has_more:
-        docs = docs[:limit]
+    has_more = next_shard_state is not None
+    next_cursor = encode_cursor(next_shard_state)
 
-    next_cursor = None
-    if last_key and has_more:
-        next_cursor = base64.b64encode(json.dumps(last_key).encode()).decode()
+    # Batch fetch owner emails instead of N+1 get_item calls
+    unique_user_ids = list({doc["user_id"] for doc in docs})
+    user_keys = [(f"USER#{uid}", f"USER#{uid}") for uid in unique_user_ids]
+    user_items = await db.batch_get_items(user_keys)
+    user_email_map: dict[str, str | None] = {
+        u["user_id"]: u.get("email") for u in user_items
+    }
 
-    # Fetch owner emails
-    user_cache: dict[str, str | None] = {}
-    items = []
-    for doc in docs:
-        uid = doc["user_id"]
-        if uid not in user_cache:
-            u = await db.get_item(pk=f"USER#{uid}", sk=f"USER#{uid}")
-            user_cache[uid] = u["email"] if u else None
-
-        items.append(
-            AdminDocumentResponse(
-                doc_id=doc["doc_id"],
-                user_id=uid,
-                user_email=user_cache[uid],
-                title=doc["title"],
-                filename=doc["filename"],
-                file_size=doc["file_size"],
-                mime_type=doc.get("mime_type", "application/pdf"),
-                status=DocumentStatus(doc["status"]),
-                page_count=doc.get("page_count"),
-                chunk_count=doc.get("chunk_count"),
-                error_message=doc.get("error_message"),
-                metadata=doc.get("metadata", {}),
-                created_at=doc["created_at"],
-                updated_at=doc["updated_at"],
-            )
+    items = [
+        AdminDocumentResponse(
+            doc_id=doc["doc_id"],
+            user_id=doc["user_id"],
+            user_email=user_email_map.get(doc["user_id"]),
+            title=doc["title"],
+            filename=doc["filename"],
+            file_size=doc["file_size"],
+            mime_type=doc.get("mime_type", "application/pdf"),
+            status=DocumentStatus(doc["status"]),
+            page_count=doc.get("page_count"),
+            chunk_count=doc.get("chunk_count"),
+            error_message=doc.get("error_message"),
+            metadata=doc.get("metadata", {}),
+            created_at=doc["created_at"],
+            updated_at=doc["updated_at"],
         )
+        for doc in docs
+    ]
 
     return AdminDocumentListResponse(
         items=items,
@@ -550,8 +449,6 @@ async def upload_admin_document(
         metadata={"uploaded_by_admin": True},
     )
 
-    from urllib.parse import quote
-
     s3_key = f"documents/{admin.user_id}/{doc.doc_id}/{doc.doc_id}.pdf"
     doc.s3_key = s3_key
 
@@ -567,7 +464,14 @@ async def upload_admin_document(
         },
     )
 
-    await db.put_item(doc.to_dynamodb_item())
+    # Atomically write document + increment counters in one transaction
+    user_pk = f"USER#{admin.user_id}"
+    await db.transact_put_and_increment(
+        item=doc.to_dynamodb_item(),
+        counter_pk=user_pk,
+        counter_sk=user_pk,
+        counters={"document_count": 1, "storage_used_bytes": file_size},
+    )
 
     job_id = await enqueue_document_processing(
         doc_id=doc.doc_id,
@@ -609,43 +513,95 @@ async def get_system_stats(
     admin: AdminUser,
     db: DynamoDB,
 ) -> SystemStatsResponse:
-    """Get system-wide statistics."""
-    # Count users
-    users, _ = await db.query(
-        pk="USER#EMAIL",
-        index_name="GSI1",
-    )
-    total_users = len(users)
+    """Get system-wide statistics using efficient count queries."""
+    # Check for pre-computed stats entity first (cached for 5 minutes)
+    stats_item = await db.get_item(pk="STATS#SYSTEM", sk="STATS#SYSTEM")
+    if stats_item:
+        computed_at = stats_item.get("computed_at")
+        if computed_at:
+            age = datetime.now(UTC) - datetime.fromisoformat(computed_at)
+            if age < timedelta(minutes=5):
+                return SystemStatsResponse(
+                    total_users=stats_item.get("total_users", 0),
+                    total_documents=stats_item.get("total_documents", 0),
+                    total_queries=stats_item.get("total_queries", 0),
+                    avg_rating=stats_item.get("avg_rating"),
+                    documents_by_status=stats_item.get("documents_by_status", {}),
+                )
 
-    # Count documents via scan
-    docs, _ = await db.scan(
-        filter_expression=Attr("entity_type").eq("DOC"),
-    )
-    total_documents = len(docs)
-
-    # Count by status
-    documents_by_status: dict[str, int] = {}
-    for doc in docs:
-        status = doc.get("status", "unknown")
-        documents_by_status[status] = documents_by_status.get(status, 0) + 1
-
-    # Count queries and compute avg rating
-    queries, _ = await db.scan(
-        filter_expression=Attr("entity_type").eq("QUERY"),
-    )
-    total_queries = len(queries)
-
-    ratings = [
-        q["feedback_rating"]
-        for q in queries
-        if q.get("feedback_rating") is not None
+    # Compute stats: count users and documents across all GSI2 shards in parallel
+    doc_count_tasks = [
+        db.query_count(pk=shard_pk, index_name="GSI2") for shard_pk in DOC_GSI2_PKS
     ]
-    avg_rating = round(sum(ratings) / len(ratings), 2) if ratings else None
+    user_count_task = db.query_count(pk="USER#EMAIL", index_name="GSI1")
+    doc_counts, total_users = await asyncio.gather(
+        asyncio.gather(*doc_count_tasks), user_count_task
+    )
+    total_documents = sum(doc_counts)
+
+    # Paginated loop across all shards for documents_by_status
+    async def _count_statuses(shard_pk: str) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        shard_cursor: dict | None = None
+        while True:
+            docs, shard_cursor = await db.query(
+                pk=shard_pk,
+                index_name="GSI2",
+                limit=500,
+                exclusive_start_key=shard_cursor,
+                projection_expression="#s",
+                expression_attribute_names={"#s": "status"},
+            )
+            for doc in docs:
+                status = doc.get("status", "unknown")
+                counts[status] = counts.get(status, 0) + 1
+            if not shard_cursor:
+                break
+        return counts
+
+    status_results = await asyncio.gather(
+        *[_count_statuses(pk) for pk in DOC_GSI2_PKS]
+    )
+    documents_by_status: dict[str, int] = {}
+    for shard_counts in status_results:
+        for status, count in shard_counts.items():
+            documents_by_status[status] = documents_by_status.get(status, 0) + count
+
+    # Paginated loop for total_queries — sum query_count across users
+    total_queries = 0
+    user_cursor: dict | None = None
+    while True:
+        users, user_cursor = await db.query(
+            pk="USER#EMAIL",
+            index_name="GSI1",
+            limit=500,
+            exclusive_start_key=user_cursor,
+            projection_expression="query_count",
+        )
+        total_queries += sum(u.get("query_count", 0) for u in users)
+        if not user_cursor:
+            break
+
+    # Cache computed stats for 5 minutes
+    now = datetime.now(UTC)
+    await db.put_item({
+        "PK": "STATS#SYSTEM",
+        "SK": "STATS#SYSTEM",
+        "entity_type": "STATS",
+        "total_users": total_users,
+        "total_documents": total_documents,
+        "total_queries": total_queries,
+        "avg_rating": None,
+        "documents_by_status": documents_by_status,
+        "computed_at": now.isoformat(),
+        "created_at": now.isoformat(),
+        "updated_at": now.isoformat(),
+    })
 
     return SystemStatsResponse(
         total_users=total_users,
         total_documents=total_documents,
         total_queries=total_queries,
-        avg_rating=avg_rating,
+        avg_rating=None,
         documents_by_status=documents_by_status,
     )
