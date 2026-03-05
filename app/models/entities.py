@@ -1,5 +1,6 @@
 """Pydantic models for DynamoDB entities."""
 
+import hashlib
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
@@ -27,6 +28,24 @@ class EntityType(str, Enum):
     CONVERSATION = "CONV"
     MESSAGE = "MSG"
     QUERY = "QUERY"
+
+
+# --- GSI2 write sharding for documents ---
+GSI2_DOC_SHARDS = 10
+
+
+def doc_gsi2_pk(doc_id: str) -> str:
+    """Compute the sharded GSI2 partition key for a document.
+
+    Uses SHA-256 for deterministic distribution (Python's hash() is randomized).
+    """
+    digest = hashlib.sha256(doc_id.encode()).digest()
+    shard = digest[0] % GSI2_DOC_SHARDS
+    return f"DOC#S{shard}"
+
+
+# All shard PKs to query (includes legacy unsharded "DOC" for pre-migration items)
+DOC_GSI2_PKS = ["DOC"] + [f"DOC#S{i}" for i in range(GSI2_DOC_SHARDS)]
 
 
 class BaseEntity(BaseModel):
@@ -72,6 +91,10 @@ class User(BaseEntity):
     settings: dict[str, Any] = Field(
         default_factory=dict, description="User preferences"
     )
+    document_count: int = Field(default=0, description="Denormalized document count")
+    conversation_count: int = Field(default=0, description="Denormalized conversation count")
+    query_count: int = Field(default=0, description="Denormalized query count")
+    storage_used_bytes: int = Field(default=0, description="Denormalized storage used")
 
     def to_dynamodb_item(self) -> dict[str, Any]:
         """Convert to DynamoDB item with keys."""
@@ -119,6 +142,9 @@ class Document(BaseEntity):
         item["SK"] = f"DOC#{self.doc_id}"
         item["GSI1PK"] = f"DOC#{self.doc_id}"
         item["GSI1SK"] = f"DOC#{self.doc_id}"
+        # GSI2 for admin list-all-documents queries (sharded to avoid hot partition)
+        item["GSI2PK"] = doc_gsi2_pk(self.doc_id)
+        item["GSI2SK"] = self.created_at.isoformat()
         item["entity_type"] = EntityType.DOCUMENT.value
         return item
 
