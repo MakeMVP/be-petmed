@@ -119,6 +119,7 @@ ERROR_RESPONSES = {
     401: {"model": ProblemDetailResponse, "description": "Unauthorized"},
     403: {"model": ProblemDetailResponse, "description": "Forbidden"},
     404: {"model": ProblemDetailResponse, "description": "Not Found"},
+    409: {"model": ProblemDetailResponse, "description": "Conflict"},
     422: {"model": ProblemDetailResponse, "description": "Validation Error"},
     429: {"model": ProblemDetailResponse, "description": "Too Many Requests"},
     500: {"model": ProblemDetailResponse, "description": "Internal Server Error"},

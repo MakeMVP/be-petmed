@@ -1,7 +1,7 @@
 """Admin-specific schemas."""
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import Field
 
@@ -32,6 +32,14 @@ class AdminUserListResponse(PaginatedResponse[AdminUserResponse]):
     pass
 
 
+class AdminInviteUserRequest(BaseSchema):
+    """Admin request to invite/create a new user."""
+
+    email: str = Field(description="Email address for the new user")
+    name: str | None = Field(default=None, description="Display name")
+    role: Literal["user", "admin"] = Field(default="user", description="User role")
+
+
 class AdminUpdateUserRequest(BaseSchema):
     """Admin request to update a user."""
 
@@ -39,7 +47,7 @@ class AdminUpdateUserRequest(BaseSchema):
     message_limit: int | None = Field(
         default=None, ge=0, le=10000, description="Daily message limit"
     )
-    role: str | None = Field(default=None, description="User role (user or admin)")
+    role: Literal["user", "admin"] | None = Field(default=None, description="User role")
 
 
 # --- Document schemas ---
