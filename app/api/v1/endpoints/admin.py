@@ -12,6 +12,7 @@ from app.api.v1.schemas.admin import (
     AdminConversationResponse,
     AdminDocumentListResponse,
     AdminDocumentResponse,
+    AdminInviteUserRequest,
     AdminMessageResponse,
     AdminUpdateUserRequest,
     AdminUserListResponse,
@@ -22,11 +23,15 @@ from app.api.v1.schemas.common import DeleteResponse, ERROR_RESPONSES
 from app.api.v1.schemas.documents import DocumentUploadResponse
 from app.config import settings
 from app.core.admin_auth import AdminUser
-from app.core.exceptions import BadRequestError, NotFoundError
+from boto3.dynamodb.conditions import Attr
+from botocore.exceptions import ClientError
+
+from app.core.exceptions import BadRequestError, ConflictError, NotFoundError
 from app.core.logging import get_logger
 from app.db.pagination import decode_cursor, encode_cursor
 from app.dependencies import DynamoDB, Storage, VectorDB
-from app.models.entities import DOC_GSI2_PKS, Document, DocumentStatus, MessageRole
+from app.models.entities import DOC_GSI2_PKS, Document, DocumentStatus, MessageRole, User
+from app.services.cognito_service import create_cognito_user, delete_cognito_user
 from app.services.user_service import delete_user_data
 from app.workers.tasks import enqueue_document_processing
 
@@ -90,6 +95,62 @@ def _build_admin_user_response(user: dict) -> AdminUserResponse:
         created_at=user["created_at"],
         updated_at=user["updated_at"],
     )
+
+
+@router.post(
+    "/users",
+    response_model=AdminUserResponse,
+    status_code=201,
+    summary="Invite user",
+    description="Create a new user in Cognito (sends invite email) and DynamoDB.",
+    responses={
+        400: ERROR_RESPONSES[400],
+        401: ERROR_RESPONSES[401],
+        403: ERROR_RESPONSES[403],
+        409: ERROR_RESPONSES[409],
+    },
+)
+async def invite_user(
+    request: AdminInviteUserRequest,
+    admin: AdminUser,
+    db: DynamoDB,
+) -> AdminUserResponse:
+    """Create a new user via Cognito AdminCreateUser and store in DynamoDB."""
+    # Create in Cognito — sends invite email with temporary password
+    user_id = await create_cognito_user(email=request.email, name=request.name)
+
+    # Create in DynamoDB with conditional write to prevent silent overwrites
+    user = User(
+        user_id=user_id,
+        email=request.email,
+        name=request.name,
+        settings={
+            "role": request.role,
+            "is_active": True,
+            "message_limit": 50,
+        },
+    )
+    try:
+        await db.put_item(
+            user.to_dynamodb_item(),
+            condition_expression=Attr("PK").not_exists(),
+        )
+    except ClientError as e:
+        # Compensating action: roll back the Cognito user on DynamoDB failure
+        await delete_cognito_user(email=request.email)
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            raise ConflictError("A user with this ID already exists in the database") from e
+        raise
+
+    logger.info(
+        "Admin invited user",
+        email=request.email,
+        user_id=user_id,
+        role=request.role,
+        admin_id=admin.user_id,
+    )
+
+    return _build_admin_user_response(user.to_dynamodb_item())
 
 
 @router.get(
@@ -157,8 +218,6 @@ async def update_user(
     if request.message_limit is not None:
         existing_settings["message_limit"] = request.message_limit
     if request.role is not None:
-        if request.role not in ("user", "admin"):
-            raise BadRequestError("Role must be 'user' or 'admin'")
         existing_settings["role"] = request.role
 
     updated = await db.update_item(
