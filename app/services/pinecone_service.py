@@ -1,6 +1,7 @@
 """Pinecone vector database service."""
 
 import asyncio
+import functools
 from typing import Any
 
 from pinecone import Pinecone, ServerlessSpec
@@ -297,13 +298,7 @@ class PineconeService:
             ) from e
 
 
-# Singleton instance
-_pinecone_service: PineconeService | None = None
-
-
+@functools.lru_cache
 def get_pinecone_service() -> PineconeService:
     """Get or create the Pinecone service singleton."""
-    global _pinecone_service
-    if _pinecone_service is None:
-        _pinecone_service = PineconeService()
-    return _pinecone_service
+    return PineconeService()

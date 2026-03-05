@@ -1,8 +1,9 @@
 """RAG (Retrieval-Augmented Generation) pipeline service."""
 
+import functools
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from app.config import settings
@@ -41,6 +42,16 @@ class RAGResponse:
     latency_ms: int
 
 
+@dataclass
+class _PreparedQuery:
+    """Internal result of the retrieval phase."""
+
+    query_obj: Query
+    prompt: str
+    sources: list[RAGSource]
+    source_dicts: list[dict[str, Any]] = field(default_factory=list)
+
+
 # System prompt for veterinary diagnosis assistance
 VETERINARY_SYSTEM_PROMPT = """You are a veterinary diagnosis and treatment support assistant.
 Your role is to help veterinary professionals by providing accurate, evidence-based information
@@ -70,6 +81,123 @@ class RAGService:
         self._top_k = settings.rag_top_k
         self._similarity_threshold = settings.rag_similarity_threshold
 
+    async def _prepare_query(
+        self,
+        question: str,
+        user_id: str,
+        conv_id: str,
+        document_ids: list[str] | None = None,
+    ) -> _PreparedQuery:
+        """Shared retrieval phase: create record, embed, search, build prompt."""
+        db = get_dynamodb_client()
+        query_obj = Query(
+            conv_id=conv_id,
+            user_id=user_id,
+            question=question,
+            document_ids=document_ids,
+            status=QueryStatus.PROCESSING,
+        )
+        await db.put_item(query_obj.to_dynamodb_item())
+        await db.put_item({
+            "PK": f"QUERY#{query_obj.query_id}",
+            "SK": f"QUERY#{query_obj.query_id}",
+            "conv_id": conv_id,
+            "user_id": user_id,
+            "entity_type": "QUERY_INDEX",
+        })
+
+        embedding_service = get_embedding_service()
+        query_embedding = await embedding_service.embed_query(question)
+
+        filter_dict: dict[str, Any] = {"user_id": user_id}
+        if document_ids:
+            filter_dict["doc_id"] = {"$in": document_ids}
+
+        pinecone = get_pinecone_service()
+        matches = await pinecone.query(
+            vector=query_embedding,
+            top_k=self._top_k,
+            filter_dict=filter_dict,
+            include_metadata=True,
+        )
+
+        sources: list[RAGSource] = []
+        context_chunks: list[str] = []
+        for match in matches:
+            if match["score"] < self._similarity_threshold:
+                continue
+            metadata = match.get("metadata", {})
+            sources.append(
+                RAGSource(
+                    chunk_id=match["id"],
+                    doc_id=metadata.get("doc_id", ""),
+                    content=metadata.get("content", ""),
+                    page_number=metadata.get("page_number"),
+                    score=match["score"],
+                    document_title=metadata.get("document_title"),
+                )
+            )
+            context_chunks.append(metadata.get("content", ""))
+
+        prompt = self._build_prompt(question, context_chunks, sources)
+
+        source_dicts = [
+            {
+                "chunk_id": s.chunk_id,
+                "doc_id": s.doc_id,
+                "page_number": s.page_number,
+                "score": s.score,
+                "document_title": s.document_title,
+            }
+            for s in sources
+        ]
+
+        return _PreparedQuery(
+            query_obj=query_obj,
+            prompt=prompt,
+            sources=sources,
+            source_dicts=source_dicts,
+        )
+
+    async def _finalize_query(
+        self,
+        conv_id: str,
+        query_id: str,
+        answer: str,
+        source_dicts: list[dict[str, Any]],
+        latency_ms: int,
+        token_usage: dict[str, int] | None = None,
+    ) -> None:
+        """Update the query record after successful generation."""
+        db = get_dynamodb_client()
+        updates: dict[str, Any] = {
+            "status": QueryStatus.COMPLETED.value,
+            "answer": answer,
+            "sources": source_dicts,
+            "model_used": settings.gemini_model,
+            "latency_ms": latency_ms,
+        }
+        if token_usage is not None:
+            updates["token_usage"] = token_usage
+        await db.update_item(
+            pk=f"CONV#{conv_id}",
+            sk=f"QUERY#{query_id}",
+            updates=updates,
+        )
+
+    async def _fail_query(self, conv_id: str, query_id: str, error: Exception) -> None:
+        """Mark a query as failed."""
+        db = get_dynamodb_client()
+        await db.update_item(
+            pk=f"CONV#{conv_id}",
+            sk=f"QUERY#{query_id}",
+            updates={
+                "status": QueryStatus.FAILED.value,
+                "error_message": "Query processing failed. Please try again.",
+            },
+        )
+        logger.error("RAG query failed", error=str(error), query_id=query_id, exc_info=True)
+
     async def query(
         self,
         question: str,
@@ -81,14 +209,6 @@ class RAGService:
     ) -> RAGResponse:
         """Execute a RAG query.
 
-        Args:
-            question: User's question.
-            user_id: User ID for filtering documents.
-            conv_id: Conversation ID for storing query.
-            document_ids: Optional specific documents to query.
-            conversation_context: Optional previous conversation messages.
-            use_streaming: Whether to use streaming response.
-
         Returns:
             RAGResponse with answer and sources.
 
@@ -97,140 +217,55 @@ class RAGService:
         """
         start_time = time.perf_counter()
 
-        # Create query record
-        db = get_dynamodb_client()
-        query_obj = Query(
-            conv_id=conv_id,
-            user_id=user_id,
-            question=question,
-            document_ids=document_ids,
-            status=QueryStatus.PROCESSING,
-        )
-        await db.put_item(query_obj.to_dynamodb_item())
+        prepared = await self._prepare_query(question, user_id, conv_id, document_ids)
 
         try:
-            # Step 1: Generate query embedding
-            embedding_service = get_embedding_service()
-            query_embedding = await embedding_service.embed_query(question)
-
-            # Step 2: Build filter for Pinecone query
-            filter_dict: dict[str, Any] = {"user_id": user_id}
-            if document_ids:
-                filter_dict["doc_id"] = {"$in": document_ids}
-
-            # Step 3: Query Pinecone for relevant chunks
-            pinecone = get_pinecone_service()
-            matches = await pinecone.query(
-                vector=query_embedding,
-                top_k=self._top_k,
-                filter_dict=filter_dict,
-                include_metadata=True,
-            )
-
-            # Step 4: Filter by similarity threshold and build sources
-            sources: list[RAGSource] = []
-            context_chunks: list[str] = []
-
-            for match in matches:
-                if match["score"] < self._similarity_threshold:
-                    continue
-
-                metadata = match.get("metadata", {})
-                sources.append(
-                    RAGSource(
-                        chunk_id=match["id"],
-                        doc_id=metadata.get("doc_id", ""),
-                        content=metadata.get("content", ""),
-                        page_number=metadata.get("page_number"),
-                        score=match["score"],
-                        document_title=metadata.get("document_title"),
-                    )
-                )
-                context_chunks.append(metadata.get("content", ""))
-
-            # Step 5: Build prompt with context
-            prompt = self._build_prompt(question, context_chunks, sources)
-
-            # Step 6: Generate response with Gemini
             gemini = get_gemini_service()
 
             if use_streaming:
-                # For streaming, we'll collect the full response
                 full_answer = ""
                 async for chunk in gemini.generate_stream(
-                    prompt=prompt,
+                    prompt=prepared.prompt,
                     system_instruction=VETERINARY_SYSTEM_PROMPT,
                     context=conversation_context,
                 ):
                     full_answer += chunk
-
                 answer = full_answer
-                token_usage = {
-                    "prompt_tokens": 0,  # Not available in streaming
-                    "completion_tokens": 0,
-                    "total_tokens": 0,
-                }
+                token_usage: dict[str, int] = {}
             else:
                 answer, token_usage = await gemini.generate(
-                    prompt=prompt,
+                    prompt=prepared.prompt,
                     system_instruction=VETERINARY_SYSTEM_PROMPT,
                     context=conversation_context,
                 )
 
             latency_ms = int((time.perf_counter() - start_time) * 1000)
 
-            # Step 7: Update query record
-            await db.update_item(
-                pk=f"CONV#{conv_id}",
-                sk=f"QUERY#{query_obj.query_id}",
-                updates={
-                    "status": QueryStatus.COMPLETED.value,
-                    "answer": answer,
-                    "sources": [
-                        {
-                            "chunk_id": s.chunk_id,
-                            "doc_id": s.doc_id,
-                            "page_number": s.page_number,
-                            "score": s.score,
-                            "document_title": s.document_title,
-                        }
-                        for s in sources
-                    ],
-                    "model_used": settings.gemini_model,
-                    "token_usage": token_usage,
-                    "latency_ms": latency_ms,
-                },
+            await self._finalize_query(
+                conv_id, prepared.query_obj.query_id, answer,
+                prepared.source_dicts, latency_ms, token_usage,
             )
 
             logger.info(
                 "RAG query completed",
-                query_id=query_obj.query_id,
-                sources=len(sources),
+                query_id=prepared.query_obj.query_id,
+                sources=len(prepared.sources),
                 latency_ms=latency_ms,
             )
 
             return RAGResponse(
                 answer=answer,
-                sources=sources,
-                query_id=query_obj.query_id,
+                sources=prepared.sources,
+                query_id=prepared.query_obj.query_id,
                 model_used=settings.gemini_model,
                 token_usage=token_usage,
                 latency_ms=latency_ms,
             )
 
         except Exception as e:
-            # Update query as failed
-            await db.update_item(
-                pk=f"CONV#{conv_id}",
-                sk=f"QUERY#{query_obj.query_id}",
-                updates={
-                    "status": QueryStatus.FAILED.value,
-                    "error_message": str(e),
-                },
-            )
-            logger.error("RAG query failed", error=str(e), query_id=query_obj.query_id)
+            await self._fail_query(conv_id, prepared.query_obj.query_id, e)
             raise ServiceUnavailableError(
-                f"Query processing failed: {e}",
+                "Query processing failed. Please try again.",
                 service="rag",
             ) from e
 
@@ -244,79 +279,19 @@ class RAGService:
     ) -> AsyncIterator[str]:
         """Execute a RAG query with streaming response.
 
-        Args:
-            question: User's question.
-            user_id: User ID for filtering documents.
-            conv_id: Conversation ID for storing query.
-            document_ids: Optional specific documents to query.
-            conversation_context: Optional previous conversation messages.
-
         Yields:
             Text chunks as they are generated.
         """
         start_time = time.perf_counter()
 
-        # Create query record
-        db = get_dynamodb_client()
-        query_obj = Query(
-            conv_id=conv_id,
-            user_id=user_id,
-            question=question,
-            document_ids=document_ids,
-            status=QueryStatus.PROCESSING,
-        )
-        await db.put_item(query_obj.to_dynamodb_item())
-
+        prepared = await self._prepare_query(question, user_id, conv_id, document_ids)
         full_answer = ""
 
         try:
-            # Step 1: Generate query embedding
-            embedding_service = get_embedding_service()
-            query_embedding = await embedding_service.embed_query(question)
-
-            # Step 2: Build filter for Pinecone query
-            filter_dict: dict[str, Any] = {"user_id": user_id}
-            if document_ids:
-                filter_dict["doc_id"] = {"$in": document_ids}
-
-            # Step 3: Query Pinecone for relevant chunks
-            pinecone = get_pinecone_service()
-            matches = await pinecone.query(
-                vector=query_embedding,
-                top_k=self._top_k,
-                filter_dict=filter_dict,
-                include_metadata=True,
-            )
-
-            # Step 4: Build sources and context
-            sources: list[RAGSource] = []
-            context_chunks: list[str] = []
-
-            for match in matches:
-                if match["score"] < self._similarity_threshold:
-                    continue
-
-                metadata = match.get("metadata", {})
-                sources.append(
-                    RAGSource(
-                        chunk_id=match["id"],
-                        doc_id=metadata.get("doc_id", ""),
-                        content=metadata.get("content", ""),
-                        page_number=metadata.get("page_number"),
-                        score=match["score"],
-                        document_title=metadata.get("document_title"),
-                    )
-                )
-                context_chunks.append(metadata.get("content", ""))
-
-            # Step 5: Build prompt with context
-            prompt = self._build_prompt(question, context_chunks, sources)
-
-            # Step 6: Stream response from Gemini
             gemini = get_gemini_service()
 
             async for chunk in gemini.generate_stream(
-                prompt=prompt,
+                prompt=prepared.prompt,
                 system_instruction=VETERINARY_SYSTEM_PROMPT,
                 context=conversation_context,
             ):
@@ -325,37 +300,13 @@ class RAGService:
 
             latency_ms = int((time.perf_counter() - start_time) * 1000)
 
-            # Step 7: Update query record
-            await db.update_item(
-                pk=f"CONV#{conv_id}",
-                sk=f"QUERY#{query_obj.query_id}",
-                updates={
-                    "status": QueryStatus.COMPLETED.value,
-                    "answer": full_answer,
-                    "sources": [
-                        {
-                            "chunk_id": s.chunk_id,
-                            "doc_id": s.doc_id,
-                            "page_number": s.page_number,
-                            "score": s.score,
-                            "document_title": s.document_title,
-                        }
-                        for s in sources
-                    ],
-                    "model_used": settings.gemini_model,
-                    "latency_ms": latency_ms,
-                },
+            await self._finalize_query(
+                conv_id, prepared.query_obj.query_id, full_answer,
+                prepared.source_dicts, latency_ms,
             )
 
         except Exception as e:
-            await db.update_item(
-                pk=f"CONV#{conv_id}",
-                sk=f"QUERY#{query_obj.query_id}",
-                updates={
-                    "status": QueryStatus.FAILED.value,
-                    "error_message": str(e),
-                },
-            )
+            await self._fail_query(conv_id, prepared.query_obj.query_id, e)
             raise
 
     def _build_prompt(
@@ -432,13 +383,7 @@ acknowledge this and provide what information is available."""
         logger.info("Submitted query feedback", query_id=query_id, rating=rating)
 
 
-# Singleton instance
-_rag_service: RAGService | None = None
-
-
+@functools.lru_cache
 def get_rag_service() -> RAGService:
     """Get or create the RAG service singleton."""
-    global _rag_service
-    if _rag_service is None:
-        _rag_service = RAGService()
-    return _rag_service
+    return RAGService()

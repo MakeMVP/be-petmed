@@ -1,6 +1,9 @@
 """Google Gemini service for LLM operations."""
 
 import asyncio
+import functools
+import queue
+import threading
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -169,19 +172,40 @@ class GeminiService:
                 system_instruction=system_instruction,
             )
 
-            # Generate streaming response
-            def _stream():
-                return self._client.models.generate_content_stream(
-                    model=model_id,
-                    contents=contents,
-                    config=config,
-                )
+            # Stream chunks via a thread to avoid blocking the event loop
+            q: queue.Queue[str | None] = queue.Queue()
+            cancel = threading.Event()
 
-            response_stream = await asyncio.to_thread(_stream)
+            def _produce():
+                try:
+                    stream = self._client.models.generate_content_stream(
+                        model=model_id,
+                        contents=contents,
+                        config=config,
+                    )
+                    for chunk in stream:
+                        if cancel.is_set():
+                            break
+                        if chunk.text:
+                            q.put(chunk.text)
+                except Exception as exc:
+                    q.put(exc)
+                finally:
+                    q.put(None)  # sentinel
 
-            for chunk in response_stream:
-                if chunk.text:
-                    yield chunk.text
+            thread = threading.Thread(target=_produce, daemon=True)
+            thread.start()
+
+            try:
+                while True:
+                    item = await asyncio.to_thread(q.get)
+                    if item is None:
+                        break
+                    if isinstance(item, Exception):
+                        raise item
+                    yield item
+            finally:
+                cancel.set()
 
         except Exception as e:
             logger.error("Gemini streaming failed", error=str(e), model=model_id)
@@ -301,13 +325,7 @@ For tables, use markdown table format."""
             ) from e
 
 
-# Singleton instance
-_gemini_service: GeminiService | None = None
-
-
+@functools.lru_cache
 def get_gemini_service() -> GeminiService:
     """Get or create the Gemini service singleton."""
-    global _gemini_service
-    if _gemini_service is None:
-        _gemini_service = GeminiService()
-    return _gemini_service
+    return GeminiService()

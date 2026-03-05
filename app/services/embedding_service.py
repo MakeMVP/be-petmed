@@ -1,6 +1,7 @@
 """Gemini embedding service for vector generation."""
 
 import asyncio
+import functools
 
 from google.genai import types
 
@@ -128,13 +129,7 @@ class EmbeddingService:
         return self._dimensions
 
 
-# Singleton instance
-_embedding_service: EmbeddingService | None = None
-
-
+@functools.lru_cache
 def get_embedding_service() -> EmbeddingService:
     """Get or create the embedding service singleton."""
-    global _embedding_service
-    if _embedding_service is None:
-        _embedding_service = EmbeddingService()
-    return _embedding_service
+    return EmbeddingService()

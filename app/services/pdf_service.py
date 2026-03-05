@@ -1,6 +1,7 @@
 """PDF extraction service with Unstructured and Gemini Vision fallback."""
 
 import asyncio
+import functools
 import io
 import re
 from dataclasses import dataclass
@@ -359,13 +360,7 @@ class PDFService:
         return await self.chunk_document(doc, chunk_size, chunk_overlap)
 
 
-# Singleton instance
-_pdf_service: PDFService | None = None
-
-
+@functools.lru_cache
 def get_pdf_service() -> PDFService:
     """Get or create the PDF service singleton."""
-    global _pdf_service
-    if _pdf_service is None:
-        _pdf_service = PDFService()
-    return _pdf_service
+    return PDFService()
